@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E3A8A"/>
+      <stop offset="1" stop-color="#0284C7"/>
+    </linearGradient>
+    <clipPath id="tile"><rect width="1024" height="1024" rx="232"/></clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+    <!-- shadow + monitor screen -->
+    <rect x="232" y="336" width="580" height="380" rx="60" fill="#000" opacity="0.27"/>
+    <rect x="212" y="316" width="580" height="380" rx="60" fill="#fff"/>
+    <rect x="236" y="340" width="532" height="332" rx="44" fill="#EFF6FF"/>
+    <!-- REC dot -->
+    <circle cx="348" cy="488" r="80" fill="#E53935" opacity="0.25"/>
+    <circle cx="348" cy="488" r="60" fill="#E53935"/>
+    <circle cx="328" cy="468" r="20" fill="#fff" opacity="0.35"/>
+    <!-- timeline bars -->
+    <rect x="460" y="440" width="256" height="38" rx="19" fill="#1D4ED8"/>
+    <rect x="460" y="496" width="188" height="30" rx="15" fill="#CBD5E1"/>
+    <!-- waveform -->
+    <g>
+      <rect x="272" y="619" width="22" height="29" rx="11" fill="#60A5FA"/>
+      <rect x="306" y="603" width="22" height="45" rx="11" fill="#34D399"/>
+      <rect x="340" y="584" width="22" height="64" rx="11" fill="#60A5FA"/>
+      <rect x="374" y="610" width="22" height="38" rx="11" fill="#34D399"/>
+      <rect x="408" y="594" width="22" height="54" rx="11" fill="#60A5FA"/>
+      <rect x="442" y="616" width="22" height="32" rx="11" fill="#34D399"/>
+      <rect x="476" y="587" width="22" height="61" rx="11" fill="#60A5FA"/>
+      <rect x="510" y="606" width="22" height="42" rx="11" fill="#34D399"/>
+      <rect x="544" y="622" width="22" height="26" rx="11" fill="#60A5FA"/>
+      <rect x="578" y="600" width="22" height="48" rx="11" fill="#34D399"/>
+      <rect x="612" y="613" width="22" height="35" rx="11" fill="#60A5FA"/>
+      <rect x="646" y="590" width="22" height="58" rx="11" fill="#34D399"/>
+      <rect x="680" y="616" width="22" height="32" rx="11" fill="#60A5FA"/>
+    </g>
+    <!-- stand -->
+    <polygon points="462,696 562,696 590,772 434,772" fill="#0F172A"/>
+    <rect x="382" y="768" width="260" height="32" rx="16" fill="#0F172A"/>
+    <!-- pipit bird -->
+    <rect x="596" y="200" width="104" height="32" rx="14" fill="#92400E"/>
+    <rect x="604" y="228" width="92" height="30" rx="14" fill="#78350F"/>
+    <rect x="701" y="298" width="10" height="26" fill="#0F172A"/>
+    <rect x="737" y="298" width="10" height="26" fill="#0F172A"/>
+    <ellipse cx="721" cy="255" rx="85" ry="85" fill="#FFF7ED"/>
+    <ellipse cx="737" cy="288" rx="69" ry="52" fill="#FB923C"/>
+    <ellipse cx="686" cy="268" rx="50" ry="42" fill="#92400E"/>
+    <ellipse cx="687" cy="268" rx="35" ry="28" fill="#B46428"/>
+    <polygon points="800,238 844,254 800,272" fill="#F97316"/>
+    <circle cx="762" cy="220" r="14" fill="#111827"/>
+    <circle cx="761" cy="215" r="5" fill="#fff"/>
+    <polygon points="700,176 724,138 744,174" fill="#92400E"/>
+  </g>
+</svg>

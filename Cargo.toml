@@ -1,0 +1,34 @@
+[package]
+name = "pipit-screen-recorder"
+version = "0.1.0"
+edition = "2021"
+description = "Pipit Screen Recorder — a simple screen recorder with a built-in editor"
+
+[dependencies]
+eframe = { version = "0.29", features = ["persistence"] }
+egui = "0.29"
+egui_extras = "0.29"
+windows-capture = "2.0"
+image = "0.25"
+anyhow = "1.0"
+tokio = { version = "1.38", features = ["full"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+rfd = "0.13"
+cpal = "0.18.2"
+hound = "3.5.1"
+wasapi = "0.25.0"
+windows = { version = "0.58", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+
+[build-dependencies]
+winresource = "0.1"
