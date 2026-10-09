@@ -1,5 +1,7 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
+use crate::theme;
+
 /// Drag state for the fullscreen area-selection overlay.
 ///
 /// Pointer positions are kept in the overlay viewport's local points; the
@@ -104,6 +106,27 @@ pub fn map_overlay_rect_to_pixels(
     Some((x, y, w, h))
 }
 
+/// Rounded, semi-transparent chip behind a line of overlay text so it stays
+/// legible over any desktop content underneath.
+fn text_chip(
+    painter: &egui::Painter,
+    mut center: Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+    view: Rect,
+) {
+    let size = galley.size() + Vec2::new(16.0, 10.0);
+    let half = size / 2.0;
+    if view.width() > size.x + 8.0 {
+        center.x = center.x.clamp(view.min.x + half.x + 4.0, view.max.x - half.x - 4.0);
+    }
+    if view.height() > size.y + 8.0 {
+        center.y = center.y.clamp(view.min.y + half.y + 4.0, view.max.y - half.y - 4.0);
+    }
+    let rect = Rect::from_center_size(center, size);
+    painter.rect_filled(rect, half.y, Color32::from_rgba_unmultiplied(15, 23, 42, 205));
+    painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+}
+
 /// Paint the frozen screenshot + dim layer + selection cutout + hints.
 /// `view` must be the exact rect the background image fills.
 pub fn paint_area_overlay(
@@ -138,25 +161,30 @@ pub fn paint_area_overlay(
             painter.rect_stroke(
                 sel,
                 0.0,
-                egui::Stroke::new(2.0_f32, Color32::from_rgb(229, 57, 53)),
+                egui::Stroke::new(2.0_f32, theme::REC),
             );
-            // Size label above the selection.
-            painter.text(
-                (sel.center_top() + Vec2::new(0.0, -8.0)).clamp(view.min, view.max),
-                egui::Align2::CENTER_BOTTOM,
+            // Size chip above the selection.
+            let galley = painter.layout_no_wrap(
                 format!("{} × {}", sel.width().round(), sel.height().round()),
-                egui::FontId::proportional(16.0),
+                egui::FontId::proportional(15.0),
                 Color32::WHITE,
             );
+            let h = galley.size().y + 10.0;
+            let center = sel.center_top() + Vec2::new(0.0, -(h / 2.0 + 8.0));
+            text_chip(painter, center, galley, view);
         }
     }
 
-    painter.text(
-        view.center_top() + Vec2::new(0.0, 28.0),
-        egui::Align2::CENTER_TOP,
-        "Drag to select the area to record  •  Release to confirm  •  ESC to cancel",
-        egui::FontId::proportional(18.0),
+    let hint = painter.layout_no_wrap(
+        "Drag to select the area to record   •   Release to confirm   •   Esc to cancel".into(),
+        egui::FontId::proportional(16.0),
         Color32::WHITE,
+    );
+    text_chip(
+        painter,
+        view.center_top() + Vec2::new(0.0, 34.0),
+        hint,
+        view,
     );
 }
 
@@ -215,16 +243,17 @@ pub fn draw_timeline(
     // Horizontal scrollbar strip: only when zooming makes the content wider
     // than the view (zoom = 1 always fits, so no bar).
     let sb_h = if full_total > view_len * 1.001 && full_total > 0.0 {
-        14.0
+        18.0
     } else {
         0.0
     };
 
-    // Light editor theme (works on dark app visuals too).
-    let bg = Color32::from_rgb(232, 232, 232);
-    let track_bg = Color32::from_rgb(248, 248, 248);
-    let grid = Color32::from_rgb(190, 190, 190);
-    let text_c = Color32::from_rgb(90, 90, 90);
+    // Timeline palette: same slate/blue family as the rest of the app, so
+    // the editor no longer looks like a second theme bolted on.
+    let bg = theme::SUBTLE_BG;
+    let track_bg = theme::SURFACE;
+    let grid = theme::BORDER;
+    let text_c = theme::TEXT_MUTED;
     painter.rect_filled(rect, 2.0_f32, bg);
     painter.rect_stroke(rect, 2.0_f32, Stroke::new(1.0_f32, grid));
 
@@ -247,7 +276,7 @@ pub fn draw_timeline(
     painter.rect_filled(
         Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + ruler_h)),
         0.0,
-        Color32::from_rgb(245, 245, 245),
+        theme::PANEL_SIDEBAR,
     );
     let step = nice_step(view_len);
     // Align first tick to a multiple of step.
@@ -264,10 +293,10 @@ pub fn draw_timeline(
                     Stroke::new(1.0_f32, grid),
                 );
                 painter.text(
-                    Pos2::new((x + 2.0).min(rect.right() - 34.0).max(rect.left() + 2.0), rect.top() + 2.0),
+                    Pos2::new((x + 2.0).min(rect.right() - 46.0).max(rect.left() + 2.0), rect.top() + 3.0),
                     egui::Align2::LEFT_TOP,
                     format_tc(t),
-                    egui::FontId::proportional(9.0),
+                    egui::FontId::proportional(10.0),
                     text_c,
                 );
             }
@@ -280,14 +309,14 @@ pub fn draw_timeline(
         Pos2::new(rect.left() + 4.0, video_top + 2.0),
         egui::Align2::LEFT_TOP,
         "Video",
-        egui::FontId::proportional(10.0),
+        egui::FontId::proportional(11.0),
         text_c,
     );
     painter.text(
         Pos2::new(rect.left() + 4.0, audio_top + 2.0),
         egui::Align2::LEFT_TOP,
         "Audio",
-        egui::FontId::proportional(10.0),
+        egui::FontId::proportional(11.0),
         text_c,
     );
 
@@ -311,7 +340,7 @@ pub fn draw_timeline(
             let x = time_to_x(gt).clamp(video_rect.left(), video_rect.right());
             painter.line_segment(
                 [Pos2::new(x, video_top), Pos2::new(x, audio_rect.bottom())],
-                Stroke::new(1.0_f32, Color32::from_rgb(220, 220, 220)),
+                Stroke::new(1.0_f32, theme::BORDER_SOFT),
             );
         }
         gt += step;
@@ -339,7 +368,7 @@ pub fn draw_timeline(
                 Pos2::new(x2, video_rect.bottom() - 1.0),
             );
             painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 200)));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, theme::BORDER));
             drew_thumb = true;
         }
     }
@@ -352,12 +381,12 @@ pub fn draw_timeline(
                 Pos2::new(x1, video_rect.top() + 1.0),
                 Pos2::new(x2, video_rect.bottom() - 1.0),
             );
-            painter.rect_filled(r, 2.0_f32, Color32::from_rgb(211, 47, 47));
+            painter.rect_filled(r, 2.0_f32, theme::REC);
             painter.text(
                 r.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("● REC {:.1}s", live),
-                egui::FontId::proportional(11.0),
+                egui::FontId::proportional(12.0),
                 Color32::WHITE,
             );
         } else if !timeline.segments.is_empty() {
@@ -382,7 +411,7 @@ pub fn draw_timeline(
                         r.center(),
                         egui::Align2::CENTER_CENTER,
                         format!("clip {} • {:.1}s", idx + 1, seg.timeline_end - seg.timeline_start),
-                        egui::FontId::proportional(10.0),
+                        egui::FontId::proportional(11.0),
                         Color32::WHITE,
                     );
                 }
@@ -392,7 +421,7 @@ pub fn draw_timeline(
                 video_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "No clips yet — press ● Record",
-                egui::FontId::proportional(11.0),
+                egui::FontId::proportional(12.0),
                 text_c,
             );
         }
@@ -403,7 +432,7 @@ pub fn draw_timeline(
     let half = (audio_rect.height() / 2.0 - 3.0).max(4.0);
     painter.line_segment(
         [Pos2::new(audio_rect.left(), mid), Pos2::new(audio_rect.right(), mid)],
-        Stroke::new(1.0_f32, Color32::from_rgb(180, 200, 230)),
+        Stroke::new(1.0_f32, theme::BORDER_SOFT),
     );
     if !tracks.waveform.is_empty() && tracks.waveform_rate > 0.0 {
         let rate = tracks.waveform_rate;
@@ -423,9 +452,9 @@ pub fn draw_timeline(
             }
             let h = (amp * half).max(1.0);
             let col = if amp < 0.12 {
-                Color32::from_rgb(140, 170, 220)
+                theme::CARD_BLUE
             } else {
-                Color32::from_rgb(66, 133, 244)
+                theme::METER_BLUE
             };
             painter.line_segment(
                 [Pos2::new(x, mid - h), Pos2::new(x, mid + h)],
@@ -437,7 +466,7 @@ pub fn draw_timeline(
             audio_rect.center(),
             egui::Align2::CENTER_CENTER,
             "Waveform appears here after recording",
-            egui::FontId::proportional(10.0),
+            egui::FontId::proportional(11.0),
             text_c,
         );
     }
@@ -453,7 +482,7 @@ pub fn draw_timeline(
             Pos2::new(audio_rect.left() + 3.0, audio_rect.top() + 2.0),
             egui::Align2::LEFT_TOP,
             "fade in",
-            egui::FontId::proportional(9.0),
+            egui::FontId::proportional(10.0),
             text_c,
         );
     }
@@ -468,7 +497,7 @@ pub fn draw_timeline(
             Pos2::new(audio_rect.right() - 3.0, audio_rect.top() + 2.0),
             egui::Align2::RIGHT_TOP,
             "fade out",
-            egui::FontId::proportional(9.0),
+            egui::FontId::proportional(10.0),
             text_c,
         );
     }
@@ -495,7 +524,7 @@ pub fn draw_timeline(
                 Pos2::new((x1 + x2) / 2.0, rect.top() + ruler_h - 2.0),
                 egui::Align2::CENTER_BOTTOM,
                 format!("{:.1}s", e - s),
-                egui::FontId::proportional(9.0),
+                egui::FontId::proportional(10.0),
                 Color32::from_rgb(140, 90, 10),
             );
         }
@@ -518,12 +547,12 @@ pub fn draw_timeline(
             ];
             painter.add(egui::Shape::convex_polygon(
                 pin.to_vec(),
-                Color32::from_rgb(66, 133, 244),
+                theme::METER_BLUE,
                 Stroke::NONE,
             ));
             painter.line_segment(
                 [Pos2::new(x, rect.top() + 11.0), Pos2::new(x, audio_rect.bottom())],
-                Stroke::new(1.5_f32, Color32::from_rgb(66, 133, 244)),
+                Stroke::new(1.5_f32, theme::METER_BLUE),
             );
         }
     }
@@ -542,14 +571,14 @@ pub fn draw_timeline(
         let thumb_w = (trough_w * (view_len / full_total.max(1e-6)) as f32)
             .clamp(24.0, trough_w);
         let thumb_x = sb.left() + ((vs / full_total.max(1e-6)) as f32) * trough_w;
-        painter.rect_filled(sb, 4.0, Color32::from_rgb(214, 216, 222));
+        painter.rect_filled(sb, 4.0, theme::PLACEHOLDER_BG);
         let hovered = response.hover_pos().map(|p| sb.contains(p)).unwrap_or(false);
         let fill = if timeline_state.scrollbar_drag {
-            Color32::from_rgb(105, 110, 126)
+            Color32::from_rgb(71, 85, 105)
         } else if hovered {
-            Color32::from_rgb(128, 133, 148)
+            Color32::from_rgb(100, 116, 139)
         } else {
-            Color32::from_rgb(152, 157, 170)
+            theme::BORDER_STRONG
         };
         let thumb = Rect::from_min_size(
             Pos2::new(thumb_x, sb.top()),
@@ -566,17 +595,17 @@ pub fn draw_timeline(
             let x = time_to_x(t);
             painter.line_segment(
                 [Pos2::new(x, video_rect.top()), Pos2::new(x, audio_rect.bottom())],
-                Stroke::new(1.0_f32, Color32::from_rgb(120, 120, 120)),
+                Stroke::new(1.0_f32, theme::TEXT_DIM),
             );
             painter.text(
                 Pos2::new(
-                    x.clamp(track_left + 24.0, rect.right() - 24.0),
-                    rect.top() + ruler_h - 2.0,
+                    x.clamp(track_left + 28.0, rect.right() - 28.0),
+                    rect.top() + ruler_h - 3.0,
                 ),
                 egui::Align2::CENTER_BOTTOM,
                 format_tc(t),
-                egui::FontId::proportional(9.0),
-                Color32::from_rgb(60, 60, 60),
+                egui::FontId::proportional(10.0),
+                theme::TEXT,
             );
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }

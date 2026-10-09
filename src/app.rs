@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use chrono::Local;
 
@@ -7,6 +7,7 @@ use crate::audio::{AudioCapture, AudioDevices, AudioResult};
 use crate::capture::{ScreenCapture, FrameData, MonitorInfo, WindowInfo};
 use crate::encoder::VideoEncoder;
 use crate::timeline::{Timeline, TimelineState};
+use crate::theme;
 use crate::ui::format_duration;
 use egui::Color32;
 
@@ -82,6 +83,9 @@ pub struct ScreenRecorderApp {
     pub show_area_selector: bool,
 
     pub error_message: Option<String>,
+    /// `(message, first_shown)` — lets stale errors auto-dismiss instead of
+    /// sitting in the status bar forever.
+    error_seen: Option<(String, Instant)>,
     pub status_message: Option<String>,
 
     // ---- audio ----
@@ -124,6 +128,8 @@ pub struct ScreenRecorderApp {
     // ---- playback ----
     playback_started: Option<Instant>,
     playback_from: f64,
+    /// Timeline second playback stops at (a selected range plays only itself).
+    playback_end: Option<f64>,
     /// Background frame stream feeding the preview while playing.
     player: Option<crate::player::PreviewPlayer>,
     /// Background audio stream feeding the preview while playing.
@@ -280,7 +286,7 @@ fn load_saved_output_dir() -> Option<PathBuf> {
     None
 }
 
-fn save_output_dir(dir: &PathBuf) {
+fn save_output_dir(dir: &Path) {
     if let Some(file) = output_dir_config_file() {
         if let Some(parent) = file.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -326,6 +332,7 @@ impl ScreenRecorderApp {
             show_settings: false,
             show_area_selector: false,
             error_message: None,
+            error_seen: None,
             status_message: Some("Ready — pick a source, then press Record.".to_string()),
             record_system_audio: true,
             record_mic: true,
@@ -355,6 +362,7 @@ impl ScreenRecorderApp {
             waveform_rate: 20.0,
             playback_started: None,
             playback_from: 0.0,
+            playback_end: None,
             player: None,
             audio_player: None,
             play_tex: None,
@@ -486,6 +494,7 @@ impl ScreenRecorderApp {
         self.waveform.clear();
         self.playback_started = None;
         self.playback_from = 0.0;
+        self.playback_end = None;
         self.fade_in = 0.0;
         self.fade_out = 0.0;
         self.preview_zoom = 1.0;
@@ -697,27 +706,33 @@ impl ScreenRecorderApp {
                     if is_paused {
                         ui.label(
                             egui::RichText::new("⏸ PAUSED")
-                                .color(Color32::from_rgb(255, 180, 60))
+                                .color(theme::PAUSED)
                                 .strong(),
                         );
                     } else {
                         ui.label(
                             egui::RichText::new("● REC")
-                                .color(Color32::from_rgb(255, 82, 82))
+                                .color(theme::REC_SOFT)
                                 .strong(),
                         );
                     }
                     ui.monospace(&dur_str);
                 });
-                ui.weak(&src_label);
+                ui.label(egui::RichText::new(theme::truncate(&src_label, 46)).color(theme::TEXT_DIM))
+                    .on_hover_text(&src_label);
                 // Live audio wave: system (blue, under) + mic (green, over),
                 // ~6s of history — proof the mic is hearing you while the
                 // main window (with its meters) is minimized.
                 ui.add_space(3.0);
-                let (rect, _) = ui.allocate_exact_size(
+                let (rect, wave_resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 42.0),
                     egui::Sense::hover(),
                 );
+                wave_resp.on_hover_text(format!(
+                    "System {:.0}%  •  Mic {:.0}%\nBlue = system, green = microphone",
+                    sys_lvl.clamp(0.0, 1.0) * 100.0,
+                    mic_lvl.clamp(0.0, 1.0) * 100.0,
+                ));
                 let painter = ui.painter();
                 painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 30));
                 let n = hist.len();
@@ -782,36 +797,28 @@ impl ScreenRecorderApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if is_paused {
-                        // "Continue" resumes the take.
-                        let resume = egui::Button::new(
-                            egui::RichText::new("▶ Continue")
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(Color32::from_rgb(56, 142, 60));
-                        if ui.add_sized([110.0, 34.0], resume).clicked() {
+                        // "Resume" continues the same take.
+                        let resume = theme::resume_btn("▶ Resume");
+                        if ui.add_sized([110.0, theme::BTN_H], resume).clicked() {
                             action = 2;
                         }
                     } else {
-                        if ui.add_sized([90.0, 34.0], egui::Button::new("⏸ Pause")).clicked() {
+                        if ui
+                            .add_sized([90.0, theme::BTN_H], egui::Button::new("⏸ Pause"))
+                            .clicked()
+                        {
                             action = 1;
                         }
                     }
-                    let stop = egui::Button::new(
-                        egui::RichText::new("■ Stop").color(Color32::WHITE).strong(),
-                    )
-                    .fill(Color32::from_rgb(211, 47, 47));
-                    if ui.add_sized([90.0, 34.0], stop).clicked() {
+                    let stop = theme::record_btn("■ Stop");
+                    if ui.add_sized([90.0, theme::BTN_H], stop).clicked() {
                         action = 3;
                     }
-                    // "Start" in the minimized state means resume/keep going.
-                    if ui
-                        .add_sized([80.0, 34.0], egui::Button::new("▶ Start"))
-                        .on_hover_text("Resume recording")
-                        .clicked()
-                    {
-                        action = 2;
-                    }
+                    ui.label(
+                        egui::RichText::new("Esc stops")
+                            .color(theme::TEXT_DIM)
+                            .small(),
+                    );
                 });
             });
             // Keep timers/labels ticking while minimized; 50ms keeps the
@@ -1320,17 +1327,23 @@ impl ScreenRecorderApp {
         if total <= 0.05 || self.is_recording() {
             return;
         }
-        let mut from = self
+        // With a dragged selection ▶ plays only that range: start at its head
+        // (or at the playhead when it already sits inside) and stop at its tail.
+        let range = self
             .timeline_state
-            .playhead
-            .or_else(|| self.timeline_state.get_selection().map(|(s, _)| s))
-            .unwrap_or(0.0)
-            .clamp(0.0, total - 0.01);
-        // Parked at the end (e.g. right after recording) means "replay".
-        if from >= total - 0.05 {
-            from = 0.0;
+            .get_selection()
+            .map(|(s, e)| (s.max(0.0), e.min(total)))
+            .filter(|(s, e)| e - s > 0.05);
+        let (start, end) = range.unwrap_or((0.0, total));
+        let mut from = self.timeline_state.playhead.unwrap_or(start);
+        // Parked at (or past) the end means "replay"; so does a playhead
+        // outside the selected range — snap back to its head.
+        if from >= end - 0.05 || from < start {
+            from = start;
         }
+        from = from.clamp(start, (end - 0.01).max(start));
         self.playback_from = from;
+        self.playback_end = Some(end);
         self.playback_started = Some(Instant::now());
         self.timeline_state.playhead = Some(from);
         self.timeline_state.is_playing = true;
@@ -1339,7 +1352,7 @@ impl ScreenRecorderApp {
         self.play_tex = None;
         self.spawn_player(from);
         // Matching audio: decode the same segments so ▶ has sound too.
-        self.spawn_audio_player(from);
+        self.spawn_audio_player(from, end);
     }
 
     pub fn pause_playback(&mut self) {
@@ -1349,6 +1362,7 @@ impl ScreenRecorderApp {
             let _ = (t0, ph);
         }
         self.playback_started = None;
+        self.playback_end = None;
         self.timeline_state.is_playing = false;
         self.player = None;
         self.audio_player = None;
@@ -1356,6 +1370,7 @@ impl ScreenRecorderApp {
 
     pub fn stop_playback(&mut self) {
         self.playback_started = None;
+        self.playback_end = None;
         self.timeline_state.is_playing = false;
         self.player = None;
         self.audio_player = None;
@@ -1377,14 +1392,15 @@ impl ScreenRecorderApp {
     }
 
     /// Start preview audio alongside the video decoder (silent when no
-    /// output device is available).
-    fn spawn_audio_player(&mut self, from: f64) {
+    /// output device is available). Decoding stops at `until` so a selected
+    /// range doesn't keep sounding past its end.
+    fn spawn_audio_player(&mut self, from: f64, until: f64) {
         self.audio_player = None;
         if self.timeline.segments.is_empty() {
             return;
         }
         let segments = self.play_segments();
-        self.audio_player = crate::audioplay::PreviewAudio::start(segments, from);
+        self.audio_player = crate::audioplay::PreviewAudio::start(segments, from, until);
     }
 
     /// Kick off a background decoder for playback. The timeline's segments
@@ -1409,7 +1425,7 @@ impl ScreenRecorderApp {
             height: self.timeline.height,
             from,
             t0,
-            total: self.timeline.total_duration,
+            total: self.playback_end.unwrap_or(self.timeline.total_duration),
             target_width: self.preview_decode_w,
         };
         self.player = crate::player::PreviewPlayer::start(spec);
@@ -1504,10 +1520,12 @@ impl ScreenRecorderApp {
             self.stop_playback();
             return;
         }
+        // Stop where the selected range ends (whole timeline when none).
+        let end = self.playback_end.unwrap_or(total).clamp(0.0, total);
         if let Some(t0) = self.playback_started {
             let t = self.playback_from + t0.elapsed().as_secs_f64();
-            if t >= total {
-                self.timeline_state.playhead = Some(total);
+            if t >= end {
+                self.timeline_state.playhead = Some(end);
                 self.stop_playback();
             } else {
                 self.timeline_state.playhead = Some(t);
@@ -1910,83 +1928,92 @@ impl ScreenRecorderApp {
 }
 
 fn apply_theme(ctx: &egui::Context) {
+    use crate::theme as th;
     // Bright, colorful light theme (was all-black dark theme).
     let mut visuals = egui::Visuals::light();
     visuals.dark_mode = false;
 
     // ---- surfaces: bright whites with a hint of blue ----
-    visuals.window_fill = Color32::from_rgb(246, 248, 252);
-    visuals.panel_fill = Color32::from_rgb(255, 255, 255);
-    visuals.faint_bg_color = Color32::from_rgb(226, 232, 240);
-    visuals.extreme_bg_color = Color32::from_rgb(241, 245, 249);
-    visuals.code_bg_color = Color32::from_rgb(237, 242, 247);
-    visuals.hyperlink_color = Color32::from_rgb(37, 99, 235);
-    visuals.warn_fg_color = Color32::from_rgb(217, 119, 6);
-    visuals.error_fg_color = Color32::from_rgb(220, 38, 38);
-    visuals.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(203, 213, 225));
-    visuals.text_cursor.stroke = egui::Stroke::new(2.0_f32, Color32::from_rgb(37, 99, 235));
+    visuals.window_fill = th::PANEL_CENTER;
+    visuals.panel_fill = th::SURFACE;
+    visuals.faint_bg_color = th::PLACEHOLDER_BG;
+    visuals.extreme_bg_color = th::SUBTLE_BG;
+    visuals.code_bg_color = th::SUBTLE_BG;
+    visuals.hyperlink_color = th::ACCENT;
+    visuals.warn_fg_color = th::WARN_TEXT;
+    visuals.error_fg_color = th::ERROR_TEXT;
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, th::BORDER);
+    visuals.text_cursor.stroke = egui::Stroke::new(2.0_f32, th::ACCENT);
 
     // ---- rounded corners everywhere ----
     visuals.window_rounding = egui::Rounding::same(12.0);
     visuals.menu_rounding = egui::Rounding::same(10.0);
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
-    visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-    visuals.widgets.open.rounding = egui::Rounding::same(8.0);
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(th::RADIUS);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(th::RADIUS);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(th::RADIUS);
+    visuals.widgets.active.rounding = egui::Rounding::same(th::RADIUS);
+    visuals.widgets.open.rounding = egui::Rounding::same(th::RADIUS);
 
     // ---- widget colors: white buttons, blue hover, vivid blue active ----
-    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(241, 245, 249);
-    visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(241, 245, 249);
+    visuals.widgets.noninteractive.bg_fill = th::SUBTLE_BG;
+    visuals.widgets.noninteractive.weak_bg_fill = th::SUBTLE_BG;
     visuals.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(203, 213, 225));
+        egui::Stroke::new(1.0_f32, th::BORDER);
     visuals.widgets.noninteractive.fg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59));
+        egui::Stroke::new(1.0_f32, th::TEXT);
 
-    visuals.widgets.inactive.bg_fill = Color32::WHITE;
-    visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
+    visuals.widgets.inactive.bg_fill = th::SURFACE;
+    visuals.widgets.inactive.weak_bg_fill = th::SURFACE;
     visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(148, 163, 184));
+        egui::Stroke::new(1.0_f32, th::BORDER_STRONG);
     visuals.widgets.inactive.fg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(15, 23, 42));
+        egui::Stroke::new(1.0_f32, th::TEXT);
 
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(219, 234, 254);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(219, 234, 254);
-    visuals.widgets.hovered.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(59, 130, 246));
+    visuals.widgets.hovered.bg_fill = th::ACCENT_SOFT;
+    visuals.widgets.hovered.weak_bg_fill = th::ACCENT_SOFT;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, th::ACCENT);
     visuals.widgets.hovered.fg_stroke =
-        egui::Stroke::new(1.5_f32, Color32::from_rgb(15, 23, 42));
+        egui::Stroke::new(1.5_f32, th::TEXT);
 
-    visuals.widgets.active.bg_fill = Color32::from_rgb(37, 99, 235);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(37, 99, 235);
-    visuals.widgets.active.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(29, 78, 216));
+    visuals.widgets.active.bg_fill = th::ACCENT;
+    visuals.widgets.active.weak_bg_fill = th::ACCENT;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, th::ACCENT_DARK);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, Color32::WHITE);
 
-    visuals.widgets.open.bg_fill = Color32::from_rgb(219, 234, 254);
-    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(219, 234, 254);
-    visuals.widgets.open.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(59, 130, 246));
+    visuals.widgets.open.bg_fill = th::ACCENT_SOFT;
+    visuals.widgets.open.weak_bg_fill = th::ACCENT_SOFT;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, th::ACCENT);
     visuals.widgets.open.fg_stroke =
-        egui::Stroke::new(1.5_f32, Color32::from_rgb(15, 23, 42));
+        egui::Stroke::new(1.5_f32, th::TEXT);
 
-    // ---- selection: vivid blue ----
-    visuals.selection.bg_fill = Color32::from_rgb(59, 130, 246);
+    // ---- selection: accent blue, same as the buttons ----
+    visuals.selection.bg_fill = th::ACCENT;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
 
     ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    // Minimum hit target: plain (non-`small`) widgets — checkbox, slider
+    // handles, DragValue, regular buttons — never get shorter than this.
+    style.spacing.interact_size = egui::vec2(28.0, 26.0);
+    // Room for "name (3840×2160)" style selected texts without clipping.
+    style.spacing.combo_width = 150.0;
+    style.spacing.window_margin = egui::Margin::same(10.0);
     ctx.set_style(style);
 }
 
 fn level_bar(ui: &mut egui::Ui, label: &str, level: f32, color: Color32) {
     ui.horizontal(|ui| {
-        ui.label(label);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
-        let bg = Color32::from_rgb(226, 232, 240);
-        ui.painter().rect_filled(rect, 4.0, bg);
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+        // Fixed-width label so the Sys/Mic bars line up column-wise.
+        ui.add_sized(
+            egui::vec2(24.0, 12.0),
+            egui::Label::new(egui::RichText::new(label).color(theme::TEXT_DIM).small()),
+        );
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(110.0, 8.0), egui::Sense::hover());
+        resp.on_hover_text(format!("{label} level: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
+        ui.painter().rect_filled(rect, 4.0, theme::METER_TRACK);
         let w = (rect.width() * level.clamp(0.0, 1.0)).max(if level > 0.01 { 3.0 } else { 0.0 });
         if w > 0.0 {
             let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()));
@@ -2060,6 +2087,23 @@ impl eframe::App for ScreenRecorderApp {
         self.update_playback();
         self.pump_player(ctx);
         self.ensure_thumb_textures(ctx);
+
+        // ---------- age out stale errors ----------
+        // 15s gives the user time to read (and the ✕ still dismisses early);
+        // a *new* error resets the clock because the text differs.
+        let err_now = self.error_message.clone();
+        match (&err_now, &mut self.error_seen) {
+            (Some(msg), seen) => match seen {
+                Some((prev, at)) if prev == msg => {
+                    if at.elapsed() > Duration::from_secs(15) {
+                        self.error_message = None;
+                        *seen = None;
+                    }
+                }
+                _ => *seen = Some((msg.clone(), Instant::now())),
+            },
+            (None, seen) => *seen = None,
+        }
 
         // ---------- fullscreen area selector (frozen-screen overlay) ----------
         if self.show_area_selector {
@@ -2235,58 +2279,73 @@ impl eframe::App for ScreenRecorderApp {
                 let dur = self.get_recording_duration();
                 let dur_str = crate::ui::format_duration(dur);
                 let src = self.recording_source_label();
-                egui::TopBottomPanel::top("rec_toolbar").show(ctx, |ui| {
+                egui::TopBottomPanel::top("rec_toolbar")
+                    .frame(
+                        egui::Frame::none()
+                            .fill(theme::PANEL_TOOLBAR)
+                            .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_BORDER))
+                            .inner_margin(theme::panel_margin()),
+                    )
+                    .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.heading(if paused { "⏸ Paused" } else { "● REC" });
+                        ui.heading(if paused {
+                            egui::RichText::new("⏸ Paused").color(theme::PAUSED)
+                        } else {
+                            egui::RichText::new("● REC").color(theme::REC_SOFT)
+                        });
                         ui.monospace(dur_str.clone());
                         ui.separator();
                         if paused {
-                            let resume = egui::Button::new(
-                                egui::RichText::new("▶ Continue")
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(Color32::from_rgb(56, 142, 60));
-                            if ui.add_sized([110.0, 32.0], resume).clicked() {
+                            let resume = theme::resume_btn("▶ Resume");
+                            if ui.add_sized([110.0, theme::BTN_H], resume).clicked() {
                                 self.resume_recording();
                             }
                         } else {
-                            if ui.add_sized([90.0, 32.0], egui::Button::new("⏸ Pause")).clicked() {
+                            if ui
+                                .add_sized([90.0, theme::BTN_H], egui::Button::new("⏸ Pause"))
+                                .clicked()
+                            {
                                 self.pause_recording();
                             }
                         }
-                        let stop = egui::Button::new(
-                            egui::RichText::new("■ Stop").color(Color32::WHITE).strong(),
-                        )
-                        .fill(Color32::from_rgb(211, 47, 47));
-                        if ui.add_sized([90.0, 32.0], stop).clicked() {
+                        let stop = theme::record_btn("■ Stop");
+                        if ui.add_sized([90.0, theme::BTN_H], stop).clicked() {
                             if let Err(e) = self.stop_recording(ctx) {
                                 self.error_message = Some(e);
                             }
                         }
-                        // "Start" resumes/keeps the take going.
-                        if ui.add_sized([80.0, 32.0], egui::Button::new("▶ Start")).clicked() {
-                            self.resume_recording();
-                        }
+                        theme::hint(ui, "Esc stops • the red border marks the captured area");
                     });
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(theme::PANEL_CENTER)
+                            .inner_margin(egui::Margin::same(8.0)),
+                    )
+                    .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(24.0);
-                        ui.heading("Recording… main window is minimized");
+                        ui.heading(theme::heading("Recording… main window is minimized"));
                         ui.label(format!("{} • {}", dur_str, src));
-                        ui.weak("Use the floating Pipit controller to Pause / Continue / Stop (or press ESC).");
-                        ui.weak("The red border on screen marks the captured area.");
+                        theme::hint(
+                            ui,
+                            "Use the floating Pipit controller to Pause / Resume / Stop (or press ESC).",
+                        );
+                        theme::hint(ui, "The red border on screen marks the captured area.");
                         if let Some(msg) = &self.status_message {
                             ui.add_space(8.0);
-                            ui.weak(msg);
+                            theme::hint(ui, msg);
                         }
                         if let Some(err) = &self.error_message {
-                            ui.colored_label(Color32::from_rgb(255, 120, 120), format!("⚠ {}", err));
+                            ui.colored_label(theme::ERROR_TEXT, format!("⚠ {}", err));
                         }
                     });
                 });
-                ctx.request_repaint_after(Duration::from_millis(200));
+                // The placeholder window only shows the tenths-of-seconds
+                // counter, so 10 Hz is plenty (the floating controller runs
+                // at 20 Hz on its own viewport).
+                ctx.request_repaint_after(Duration::from_millis(100));
                 return;
             }
         }
@@ -2295,24 +2354,21 @@ impl eframe::App for ScreenRecorderApp {
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(239, 246, 255))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(191, 219, 254),
-                    ))
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+                    .fill(theme::PANEL_TOOLBAR)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_BORDER))
+                    .inner_margin(theme::panel_margin()),
             )
             .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(
-                    egui::RichText::new("🐦 Pipit").color(Color32::from_rgb(29, 78, 216)),
+                    egui::RichText::new("🐦 Pipit").color(theme::ACCENT_DARK),
                 );
-                ui.label(egui::RichText::new("screen recorder").color(Color32::from_rgb(219, 39, 119)).small());
+                ui.label(egui::RichText::new("screen recorder").color(theme::BRAND).small());
                 ui.separator();
 
                 let recording = self.is_recording();
                 ui.add_enabled_ui(!recording, |ui| {
-                    egui::ComboBox::from_label("Source")
+                    let src = egui::ComboBox::from_label("Source")
                         .selected_text(match self.capture_mode {
                             CaptureMode::Monitor => "🖥 Monitor",
                             CaptureMode::Window => "🪟 Window",
@@ -2323,13 +2379,16 @@ impl eframe::App for ScreenRecorderApp {
                             ui.selectable_value(&mut self.capture_mode, CaptureMode::Window, "🪟 Window");
                             ui.selectable_value(&mut self.capture_mode, CaptureMode::Region, "✂ Region");
                         });
+                    src.response
+                        .on_hover_text("What to record: a whole monitor, one window, or a region")
+                        .on_disabled_hover_text("Locked while recording — press Stop first");
 
                     match self.capture_mode {
                         CaptureMode::Monitor => {
                             let label = self
                                 .selected_monitor
                                 .and_then(|i| self.monitors.get(i))
-                                .map(|m| format!("{} ({}×{})", m.name, m.width, m.height))
+                                .map(|m| theme::truncate(&format!("{} ({}×{})", m.name, m.width, m.height), 32))
                                 .unwrap_or_else(|| "Select…".to_string());
                             egui::ComboBox::from_id_salt("monitor_pick")
                                 .selected_text(label)
@@ -2338,29 +2397,35 @@ impl eframe::App for ScreenRecorderApp {
                                         ui.selectable_value(
                                             &mut self.selected_monitor,
                                             Some(i),
-                                            format!("{} ({}×{})", m.name, m.width, m.height),
+                                            theme::truncate(&format!("{} ({}×{})", m.name, m.width, m.height), 48),
                                         );
                                     }
                                 });
-                            if ui.small_button("⟳").on_hover_text("Refresh monitors").clicked() {
+                            if ui.add(theme::icon_btn("⟳"))
+                                .on_hover_text("Refresh monitors")
+                                .clicked()
+                            {
                                 self.refresh_monitors();
                             }
                         }
                         CaptureMode::Window => {
-                            let label = self.selected_window.clone().unwrap_or_else(|| "Select…".to_string());
+                            let label = self
+                                .selected_window
+                                .clone()
+                                .map(|t| theme::truncate(&t, 32))
+                                .unwrap_or_else(|| "Select…".to_string());
                             egui::ComboBox::from_id_salt("window_pick")
                                 .selected_text(label)
                                 .show_ui(ui, |ui| {
                                     for w in &self.windows {
-                                        let short = if w.title.chars().count() > 48 {
-                                            format!("{}…", w.title.chars().take(48).collect::<String>())
-                                        } else {
-                                            w.title.clone()
-                                        };
+                                        let short = theme::truncate(&w.title, 48);
                                         ui.selectable_value(&mut self.selected_window, Some(w.title.clone()), short);
                                     }
                                 });
-                            if ui.small_button("⟳").on_hover_text("Refresh windows").clicked() {
+                            if ui.add(theme::icon_btn("⟳"))
+                                .on_hover_text("Refresh windows")
+                                .clicked()
+                            {
                                 self.refresh_windows();
                             }
                         }
@@ -2370,7 +2435,11 @@ impl eframe::App for ScreenRecorderApp {
                             } else {
                                 ui.label("No region yet");
                             }
-                            if ui.button("Select Area").clicked() {
+                            if ui
+                                .button("Select Area")
+                                .on_hover_text("Freeze the screen, then drag out the region to record")
+                                .clicked()
+                            {
                                 self.start_area_selection(ctx);
                             }
                         }
@@ -2383,63 +2452,102 @@ impl eframe::App for ScreenRecorderApp {
                         egui::DragValue::new(&mut self.target_fps)
                             .range(15..=60)
                             .suffix(" FPS"),
-                    );
+                    )
+                    .on_hover_text("Frames per second of the recorded video (15–60)")
+                    .on_disabled_hover_text("Locked while recording");
                 });
                 ui.separator();
 
                 match self.state {
                     RecordingState::Idle => {
-                        let btn = egui::Button::new(egui::RichText::new("● Record").color(Color32::WHITE).strong())
-                            .fill(Color32::from_rgb(211, 47, 47));
-                        if ui.add_sized([110.0, 32.0], btn).clicked() {
+                        let btn = theme::record_btn("● Record");
+                        if ui
+                            .add_sized([110.0, theme::BTN_H], btn)
+                            .on_hover_text("Start recording (Esc stops while recording)")
+                            .clicked()
+                        {
                             if let Err(e) = self.start_recording(ctx) {
                                 self.error_message = Some(e);
                             }
                         }
                     }
                     RecordingState::Recording => {
-                        if ui.add_sized([90.0, 32.0], egui::Button::new("⏸ Pause")).clicked() {
+                        if ui
+                            .add_sized([90.0, theme::BTN_H], egui::Button::new("⏸ Pause"))
+                            .on_hover_text("Pause the take (resumes without a new clip)")
+                            .clicked()
+                        {
                             self.pause_recording();
                         }
-                        let stop = egui::Button::new(egui::RichText::new("■ Stop").color(Color32::WHITE).strong())
-                            .fill(Color32::from_rgb(211, 47, 47));
-                        if ui.add_sized([90.0, 32.0], stop).clicked() {
+                        let stop = theme::record_btn("■ Stop");
+                        if ui
+                            .add_sized([90.0, theme::BTN_H], stop)
+                            .on_hover_text("Stop and save this take (Esc)")
+                            .clicked()
+                        {
                             if let Err(e) = self.stop_recording(ctx) {
                                 self.error_message = Some(e);
                             }
                         }
-                        let secs = self.get_recording_duration().as_secs_f64();
                         ui.label(
-                            egui::RichText::new(format!("● REC {}", format_duration(self.get_recording_duration())))
-                                .color(Color32::from_rgb(255, 82, 82))
-                                .strong(),
+                            egui::RichText::new(format!(
+                                "● REC {}",
+                                format_duration(self.get_recording_duration())
+                            ))
+                            .color(theme::REC_SOFT)
+                            .strong(),
                         );
-                        let _ = secs;
                     }
                     RecordingState::Paused => {
-                        let resume = egui::Button::new(egui::RichText::new("▶ Resume").color(Color32::WHITE).strong())
-                            .fill(Color32::from_rgb(56, 142, 60));
-                        if ui.add_sized([100.0, 32.0], resume).clicked() {
+                        let resume = theme::resume_btn("▶ Resume");
+                        if ui
+                            .add_sized([100.0, theme::BTN_H], resume)
+                            .on_hover_text("Continue the same take (Esc stops)")
+                            .clicked()
+                        {
                             self.resume_recording();
                         }
-                        if ui.add_sized([90.0, 32.0], egui::Button::new("■ Stop")).clicked() {
+                        let stop = theme::record_btn("■ Stop");
+                        if ui
+                            .add_sized([90.0, theme::BTN_H], stop)
+                            .on_hover_text("Stop and save this take (Esc)")
+                            .clicked()
+                        {
                             if let Err(e) = self.stop_recording(ctx) {
                                 self.error_message = Some(e);
                             }
                         }
-                        ui.label(format!("⏸ {}", format_duration(self.get_recording_duration())));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⏸ {}",
+                                format_duration(self.get_recording_duration())
+                            ))
+                            .color(theme::PAUSED)
+                            .strong(),
+                        );
                     }
                     RecordingState::SelectingArea => {}
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Settings").clicked() {
+                    let settings = ui
+                        .selectable_label(self.show_settings, "⚙ Settings")
+                        .on_hover_text("Audio levels, output folder, FPS and more");
+                    if settings.clicked() {
                         self.show_settings = !self.show_settings;
                     }
                     let can_edit = !self.is_recording() && self.has_editable_video();
                     ui.add_enabled_ui(can_edit, |ui| {
                         let label = if self.show_editor { "✂ Editing…" } else { "✂ Edit video" };
-                        if ui.button(label).on_hover_text("Show the editing timeline").clicked() {
+                        let r = ui
+                            .button(label)
+                            .on_hover_text(if self.show_editor {
+                                "Hide the editing timeline (Space plays, Del deletes a selection)"
+                            } else {
+                                "Show the editing timeline: cut, trim, silence, fades"
+                            })
+                            .on_disabled_hover_text("Record a clip first — then you can edit it");
+                        if r.clicked() {
                             if self.show_editor {
                                 self.close_editor();
                             } else {
@@ -2454,213 +2562,313 @@ impl eframe::App for ScreenRecorderApp {
         // ---------- left sidebar ----------
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .default_width(270.0)
+            .default_width(264.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(241, 245, 249))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(203, 213, 225),
-                    ))
-                    .inner_margin(egui::Margin::symmetric(8.0, 8.0)),
+                    .fill(theme::PANEL_SIDEBAR)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(6.0, 6.0)),
             )
             .show(ctx, |ui| {
-                ui.heading(
-                    egui::RichText::new("⚙ Setup").color(Color32::from_rgb(29, 78, 216)),
-                );
+                ui.label(theme::heading("⚙ Setup").size(19.0).strong());
                 ui.add_space(4.0);
 
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(255, 255, 255))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(147, 197, 253),
-                    ))
+                // Vertical scrollbar for short windows: everything below the
+                // title scrolls, the title itself stays put.
+                egui::ScrollArea::vertical()
+                    .id_salt("setup_sidebar_scroll")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("⏺ Recording")
-                            .color(Color32::from_rgb(220, 38, 38))
-                            .strong(),
-                    );
-                    ui.label(format!("State: {}", match self.state {
-                        RecordingState::Idle => "Idle",
-                        RecordingState::SelectingArea => "Selecting area…",
-                        RecordingState::Recording => "Recording",
-                        RecordingState::Paused => "Paused",
-                    }));
-                    ui.label(format!("Duration: {}", format_duration(self.get_recording_duration())));
-                    ui.label(format!("Frames: {}", self.current_frame_count));
-                    if let Some((w, h)) = self.capture.get_dimensions() {
-                        ui.label(format!("Capturing: {}×{}", w, h));
-                    } else if let Some((_, _, w, h)) = self.capture_region {
-                        if self.capture_mode == CaptureMode::Region {
-                            ui.label(format!("Region: {}×{}", w, h));
-                        }
-                    }
-                    ui.label(format!("Output FPS: {}", self.target_fps));
-                });
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+                        ui.style_mut().spacing.slider_width = 110.0;
+                        ui.style_mut().spacing.combo_width = 150.0;
 
-                ui.add_space(8.0);
-
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(255, 255, 255))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(110, 231, 183),
-                    ))
-                    .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("🔊 Audio")
-                                .color(Color32::from_rgb(5, 150, 105))
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("⟳").on_hover_text("Rescan audio devices").clicked() {
-                                self.refresh_audio();
-                                self.status_message = Some("Audio devices rescanned.".into());
-                            }
-                        });
-                    });
-                    let rec = self.is_recording();
-                    ui.add_enabled_ui(!rec, |ui| {
-                        ui.checkbox(&mut self.record_system_audio, "System sound (speakers)");
-                        ui.checkbox(&mut self.record_mic, "Microphone");
-                        if self.record_mic {
-                            let mics = self.audio_devices.microphones.clone();
-                            let current = self.mic_device.clone().unwrap_or_else(|| "Default".into());
-                            egui::ComboBox::from_id_salt("mic_pick")
-                                .selected_text(current)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.mic_device, None, "Default");
-                                    for m in mics {
-                                        ui.selectable_value(&mut self.mic_device, Some(m.clone()), m);
+                        // ---- recording status ----
+                        theme::titled_card(
+                            ui,
+                            theme::CARD_BLUE,
+                            egui::RichText::new("⏺ Recording").color(theme::REC_TEXT).strong(),
+                            |ui| {
+                                theme::kv(
+                                    ui,
+                                    "State",
+                                    match self.state {
+                                        RecordingState::Idle => "Idle",
+                                        RecordingState::SelectingArea => "Selecting area…",
+                                        RecordingState::Recording => "Recording",
+                                        RecordingState::Paused => "Paused",
+                                    },
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Duration",
+                                    format_duration(self.get_recording_duration()),
+                                );
+                                theme::kv(ui, "Frames", self.current_frame_count.to_string());
+                                if let Some((w, h)) = self.capture.get_dimensions() {
+                                    theme::kv(ui, "Capturing", format!("{}×{}", w, h));
+                                } else if let Some((_, _, w, h)) = self.capture_region {
+                                    if self.capture_mode == CaptureMode::Region {
+                                        theme::kv(ui, "Region", format!("{}×{}", w, h));
                                     }
-                                });
-                        }
-                        ui.add(egui::Slider::new(&mut self.system_volume, 0.0..=1.5).text("System vol"));
-                        ui.add(egui::Slider::new(&mut self.mic_volume, 0.0..=1.5).text("Mic vol"));
-                    });
-                    if rec {
-                        ui.weak("Audio toggles lock while recording.");
-                    }
-                    // Live meters (also animate before recording when idle? show last levels or 0).
-                    let (sys_lvl, mic_lvl) = match &self.audio_capture {
-                        Some(cap) => (cap.system_level(), cap.mic_level()),
-                        None => (0.0, 0.0),
-                    };
-                    if self.record_system_audio {
-                        level_bar(ui, "Sys", sys_lvl, Color32::from_rgb(66, 165, 245));
-                    }
-                    if self.record_mic {
-                        level_bar(ui, "Mic", mic_lvl, Color32::from_rgb(102, 187, 106));
-                    }
-                    if !self.record_system_audio && !self.record_mic {
-                        ui.weak("Audio off — video only.");
-                    }
-                    if self.record_mic
-                        && self.audio_devices.microphones.is_empty()
-                    {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 180, 100),
-                            "No mic devices found — check connection / Windows mic privacy, then ⟳.",
+                                }
+                                theme::kv(ui, "Output FPS", self.target_fps.to_string());
+                            },
                         );
-                    }
-                    if let Some(sum) = &self.last_audio_result {
-                        for w in &sum.warnings {
-                            ui.colored_label(Color32::from_rgb(255, 120, 120), format!("⚠ {w}"));
-                        }
-                    }
-                });
 
-                ui.add_space(8.0);
+                        ui.add_space(theme::CARD_GAP);
 
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(255, 255, 255))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(253, 224, 71),
-                    ))
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("✂ Selection")
-                            .color(Color32::from_rgb(202, 138, 4))
-                            .strong(),
-                    );
-                    if let Some((s, e)) = self.timeline_state.get_selection() {
-                        ui.label(format!("{:.2}s → {:.2}s ({:.2}s)", s, e, e - s));
-                        ui.horizontal(|ui| {
-                            if ui.button("Delete (Del)").clicked() {
-                                self.cut_selected_range();
+                        // ---- audio ----
+                        theme::card(ui, theme::CARD_GREEN, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("🔊 Audio")
+                                        .color(theme::CARD_TEXT_GREEN)
+                                        .small()
+                                        .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("⟳")
+                                            .on_hover_text("Rescan audio devices")
+                                            .clicked()
+                                        {
+                                            self.refresh_audio();
+                                            self.status_message =
+                                                Some("Audio devices rescanned.".into());
+                                        }
+                                    },
+                                );
+                            });
+                            let rec = self.is_recording();
+                            ui.add_enabled_ui(!rec, |ui| {
+                                ui.checkbox(
+                                    &mut self.record_system_audio,
+                                    egui::RichText::new("System sound (speakers)").small(),
+                                );
+                                ui.checkbox(
+                                    &mut self.record_mic,
+                                    egui::RichText::new("Microphone").small(),
+                                );
+                                if self.record_mic {
+                                    let mics = self.audio_devices.microphones.clone();
+                                    let current =
+                                        self.mic_device.clone().unwrap_or_else(|| "Default".into());
+                                    egui::ComboBox::from_id_salt("mic_pick")
+                                        .selected_text(theme::truncate(&current, 24))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.mic_device, None, "Default");
+                                            for m in mics {
+                                                ui.selectable_value(
+                                                    &mut self.mic_device,
+                                                    Some(m.clone()),
+                                                    m,
+                                                );
+                                            }
+                                        });
+                                }
+                                ui.add(
+                                    egui::Slider::new(&mut self.system_volume, 0.0..=1.5)
+                                        .text("System vol"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut self.mic_volume, 0.0..=1.5)
+                                        .text("Mic vol"),
+                                );
+                            });
+                            if rec {
+                                theme::hint(ui, "Audio toggles lock while recording.");
                             }
-                            if ui.button("Trim").clicked() {
-                                self.trim_selection();
+                            // Live meters (also animate before recording when idle? show last levels or 0).
+                            let (sys_lvl, mic_lvl) = match &self.audio_capture {
+                                Some(cap) => (cap.system_level(), cap.mic_level()),
+                                None => (0.0, 0.0),
+                            };
+                            if self.record_system_audio {
+                                level_bar(ui, "Sys", sys_lvl, theme::METER_BLUE);
                             }
-                            if ui.small_button("Clear").clicked() {
-                                self.timeline_state.clear_selection();
+                            if self.record_mic {
+                                level_bar(ui, "Mic", mic_lvl, theme::METER_GREEN);
                             }
-                        });
-                    } else {
-                        ui.weak("Drag on the timeline to select.");
-                    }
-                    if let Some(ph) = self.timeline_state.playhead {
-                        ui.label(format!("Playhead: {}", crate::ui::format_tc(ph)));
-                    }
-                    ui.separator();
-                    ui.label(format!(
-                        "Clips: {}  •  Total: {:.1}s",
-                        self.timeline.segments.len(),
-                        self.live_duration_secs()
-                    ));
-                    if self.fade_in > 0.05 || self.fade_out > 0.05 {
-                        ui.label(format!("Fades: in {:.1}s / out {:.1}s", self.fade_in, self.fade_out));
-                    }
-                    if self.show_editor {
-                        ui.weak("Full editor tools are docked below the preview.");
-                    } else if self.has_editable_video() && !self.is_recording() {
-                        if ui.button("✂ Edit video").on_hover_text("Show the editing timeline").clicked() {
-                            self.open_editor();
-                        }
-                    } else {
-                        ui.weak("Record a clip, then press Edit video to edit.");
-                    }
-                });
-
-                ui.add_space(8.0);
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(255, 255, 255))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(196, 181, 253),
-                    ))
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("💾 Save folder")
-                            .color(Color32::from_rgb(124, 58, 237))
-                            .strong(),
-                    );
-                    ui.weak(format!("{}", self.output_dir.display()))
-                        .on_hover_text(format!("{}", self.output_dir.display()));
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(!self.is_recording(), |ui| {
-                            if ui.button("Browse…").on_hover_text("Choose where new recordings are saved").clicked() {
-                                if let Some(dir) = Self::pick_output_dir_dialog(&self.output_dir) {
-                                    self.set_output_dir(dir);
+                            if !self.record_system_audio && !self.record_mic {
+                                theme::hint(ui, "Audio off — video only.");
+                            }
+                            if self.record_mic && self.audio_devices.microphones.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No mic found — check connection / mic privacy, then ⟳.",
+                                    )
+                                    .color(theme::WARN_TEXT)
+                                    .small(),
+                                );
+                            }
+                            if let Some(sum) = &self.last_audio_result {
+                                for w in &sum.warnings {
+                                    ui.label(
+                                        egui::RichText::new(format!("⚠ {w}"))
+                                            .color(theme::ERROR_TEXT)
+                                            .small(),
+                                    );
                                 }
                             }
                         });
-                        if ui.small_button("Open").on_hover_text("Open the save folder").clicked() {
-                            let _ = std::process::Command::new("explorer").arg(&self.output_dir).spawn();
-                        }
+
+                        ui.add_space(theme::CARD_GAP);
+
+                        // ---- selection ----
+                        theme::titled_card(
+                            ui,
+                            theme::CARD_AMBER,
+                            egui::RichText::new("✂ Selection").color(theme::PAUSED).strong(),
+                            |ui| {
+                                let rec = self.is_recording();
+                                if let Some((s, e)) = self.timeline_state.get_selection() {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:.2}s → {:.2}s ({:.2}s)",
+                                            s,
+                                            e,
+                                            e - s
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(!rec, |ui| {
+                                            if ui
+                                                .small_button("Delete (Del)")
+                                                .on_hover_text(
+                                                    "Remove the selected range from the timeline",
+                                                )
+                                                .on_disabled_hover_text("Stop recording first")
+                                                .clicked()
+                                            {
+                                                self.cut_selected_range();
+                                            }
+                                            if ui
+                                                .small_button("Trim")
+                                                .on_hover_text(
+                                                    "Keep only the selected range, drop the rest",
+                                                )
+                                                .on_disabled_hover_text("Stop recording first")
+                                                .clicked()
+                                            {
+                                                self.trim_selection();
+                                            }
+                                        });
+                                        if ui
+                                            .small_button("Clear")
+                                            .on_hover_text("Deselect the current range")
+                                            .clicked()
+                                        {
+                                            self.timeline_state.clear_selection();
+                                        }
+                                    });
+                                } else {
+                                    theme::hint(ui, "Drag on the timeline to select.");
+                                }
+                                if let Some(ph) = self.timeline_state.playhead {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Playhead: {}",
+                                            crate::ui::format_tc(ph)
+                                        ))
+                                        .small(),
+                                    );
+                                }
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Clips: {}  •  Total: {:.1}s",
+                                        self.timeline.segments.len(),
+                                        self.live_duration_secs()
+                                    ))
+                                    .small(),
+                                );
+                                if self.fade_in > 0.05 || self.fade_out > 0.05 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Fades: in {:.1}s / out {:.1}s",
+                                            self.fade_in, self.fade_out
+                                        ))
+                                        .small(),
+                                    );
+                                }
+                                if self.show_editor {
+                                    theme::hint(ui, "Full editor tools are docked below the preview.");
+                                } else if self.has_editable_video() && !self.is_recording() {
+                                    if ui
+                                        .small_button("✂ Edit video")
+                                        .on_hover_text("Show the editing timeline (cut, trim, fades)")
+                                        .clicked()
+                                    {
+                                        self.open_editor();
+                                    }
+                                } else {
+                                    theme::hint(ui, "Record a clip, then press Edit video to edit.");
+                                }
+                            },
+                        );
+
+                        ui.add_space(theme::CARD_GAP);
+                        theme::card(ui, theme::CARD_VIOLET, |ui| {
+                            ui.label(
+                                egui::RichText::new("💾 Save folder")
+                                    .color(theme::CARD_TEXT_VIOLET)
+                                    .small()
+                                    .strong(),
+                            );
+                            let dir = self.output_dir.display().to_string();
+                            ui.label(
+                                egui::RichText::new(theme::truncate(&dir, 38))
+                                    .color(theme::TEXT_MUTED)
+                                    .small(),
+                            )
+                            .on_hover_text(&dir);
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(!self.is_recording(), |ui| {
+                                    if ui
+                                        .small_button("Browse…")
+                                        .on_hover_text("Choose where new recordings are saved")
+                                        .clicked()
+                                    {
+                                        if let Some(dir) =
+                                            Self::pick_output_dir_dialog(&self.output_dir)
+                                        {
+                                            self.set_output_dir(dir);
+                                        }
+                                    }
+                                });
+                                if ui
+                                    .small_button("Open")
+                                    .on_hover_text("Open the save folder in Explorer")
+                                    .clicked()
+                                {
+                                    let _ = std::process::Command::new("explorer")
+                                        .arg(&self.output_dir)
+                                        .spawn();
+                                }
+                            });
+                            if self.is_recording() {
+                                theme::hint(ui, "Locked while recording.");
+                            } else {
+                                theme::hint(ui, "Next: recording_<date>_<time>.mp4");
+                            }
+                        });
+                        ui.add_space(2.0);
+                        let last = format!("Last file: {}", self.output_path.display());
+                        ui.label(
+                            egui::RichText::new(theme::truncate(&last, 42))
+                                .color(theme::TEXT_DIM)
+                                .small(),
+                        )
+                        .on_hover_text(last);
                     });
-                    if self.is_recording() {
-                        ui.weak("Locked while recording.");
-                    } else {
-                        ui.weak("Next file: recording_<date>_<time>.mp4");
-                    }
-                });
-                ui.add_space(4.0);
-                ui.weak(format!("Last file: {}", self.output_path.display()));
             });
 
         // ---------- status bar (very bottom) ----------
@@ -2670,27 +2878,30 @@ impl eframe::App for ScreenRecorderApp {
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(219, 234, 254))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(147, 197, 253),
-                    ))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
+                    .fill(theme::PANEL_STATUS)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_BORDER))
+                    .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
             )
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(msg) = &self.status_message {
                     ui.label(
-                        egui::RichText::new(msg).color(Color32::from_rgb(30, 58, 138)),
-                    );
+                        egui::RichText::new(theme::truncate(msg, 140)).color(theme::ACCENT_DARK),
+                    )
+                    .on_hover_text(msg);
                 } else {
                     ui.label("Ready");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(err) = &self.error_message {
-                        ui.colored_label(Color32::from_rgb(220, 38, 38), format!("⚠ {}", err));
-                        if ui.small_button("✕").clicked() {
+                        ui.colored_label(theme::ERROR_TEXT, format!("⚠ {}", err));
+                        if ui
+                            .add(theme::icon_btn("✕"))
+                            .on_hover_text("Dismiss this error")
+                            .clicked()
+                        {
                             self.error_message = None;
+                            self.error_seen = None;
                         }
                     }
                 });
@@ -2716,39 +2927,74 @@ impl eframe::App for ScreenRecorderApp {
                 .default_height(296.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(Color32::from_rgb(255, 251, 235))
-                        .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgb(253, 224, 71),
-                        ))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+                        .fill(theme::PANEL_EDITOR)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::CARD_AMBER))
+                        .inner_margin(theme::panel_margin()),
                 )
                 .show(ctx, |ui| {
                     // Toolbar (ribbon row).
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("💾 Save and Close").on_hover_text("Export the edited timeline to a new MP4 (volume + fades applied)").clicked() {
+                        let save = theme::primary_btn("💾 Save and Close");
+                        if ui
+                            .add_sized([150.0, theme::BTN_H], save)
+                            .on_hover_text("Export the edited timeline to a new MP4 (volume + fades applied)")
+                            .clicked()
+                        {
                             self.save_edited_copy();
                         }
                         ui.separator();
                         ui.add_enabled_ui(has_sel && !is_rec, |ui| {
-                            if ui.button("❌ Delete").on_hover_text("Delete the selected range (Del)").clicked() {
+                            if ui
+                                .button("❌ Delete")
+                                .on_hover_text("Delete the selected range (Del)")
+                                .on_disabled_hover_text(if is_rec {
+                                    "Stop recording first"
+                                } else {
+                                    "Select a range on the timeline first"
+                                })
+                                .clicked()
+                            {
                                 self.cut_selected_range();
                             }
-                            if ui.button("✂ Trim").on_hover_text("Keep only the selected range").clicked() {
+                            if ui
+                                .button("✂ Trim")
+                                .on_hover_text("Keep only the selected range, drop the rest")
+                                .on_disabled_hover_text(if is_rec {
+                                    "Stop recording first"
+                                } else {
+                                    "Select a range on the timeline first"
+                                })
+                                .clicked()
+                            {
                                 self.trim_selection();
                             }
                         });
                         ui.add_enabled_ui(!is_rec && has_timeline && !self.waveform.is_empty(), |ui| {
-                            if ui.button("🔇 Silence").on_hover_text("Auto-remove silent parts").clicked() {
-                                // Threshold is on the perceptual (dB-mapped) waveform:
-                                // 0.12 ≈ -44 dB, i.e. room noise counts as silence, speech doesn't.
+                            if ui
+                                .button("🔇 Silence")
+                                .on_hover_text("Auto-remove silent parts (−44 dB threshold, 0.4 s minimum gap)")
+                                .on_disabled_hover_text(if is_rec {
+                                    "Stop recording first"
+                                } else {
+                                    "Needs a recorded clip with audio"
+                                })
+                                .clicked()
+                            {
                                 self.delete_silence(0.12, 0.4);
                             }
                         });
-                        if ui.button(format!("🔊 Volume ×{:.2}", self.master_volume)).on_hover_text("Volume + fades applied on Save").clicked() {
+                        if ui
+                            .button(format!("🔊 Volume ×{:.2}", self.master_volume))
+                            .on_hover_text("Master volume + fades, applied when you Save")
+                            .clicked()
+                        {
                             self.show_volume_popup = !self.show_volume_popup;
                         }
-                        if ui.button(format!("Fade In {:.1}s", self.fade_in)).clicked() {
+                        if ui
+                            .button(format!("Fade In {:.1}s", self.fade_in))
+                            .on_hover_text("Click to cycle the fade-in: off → 0.5s → 1s → 2s")
+                            .clicked()
+                        {
                             self.fade_in = match self.fade_in {
                                 x if x < 0.1 => 0.5,
                                 x if x < 0.75 => 1.0,
@@ -2756,7 +3002,11 @@ impl eframe::App for ScreenRecorderApp {
                                 _ => 0.0,
                             };
                         }
-                        if ui.button(format!("Fade Out {:.1}s", self.fade_out)).clicked() {
+                        if ui
+                            .button(format!("Fade Out {:.1}s", self.fade_out))
+                            .on_hover_text("Click to cycle the fade-out: off → 0.5s → 1s → 2s")
+                            .clicked()
+                        {
                             self.fade_out = match self.fade_out {
                                 x if x < 0.1 => 0.5,
                                 x if x < 0.75 => 1.0,
@@ -2766,20 +3016,26 @@ impl eframe::App for ScreenRecorderApp {
                         }
                         ui.separator();
                         ui.add_enabled_ui(has_timeline, |ui| {
-                            if ui.button("🔍 Zoom Selection").clicked() {
+                            if ui
+                                .button("🔍 Zoom Selection")
+                                .on_hover_text("Fit the selected range to the visible width")
+                                .clicked()
+                            {
                                 self.timeline_state.zoom_to_selection(total);
                             }
-                            if ui.button("↔ Show All").clicked() {
+                            if ui
+                                .button("↔ Show All")
+                                .on_hover_text("Zoom out so the whole timeline fits (zoom 1×)")
+                                .clicked()
+                            {
                                 self.timeline_state.show_all();
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // The keyboard-hint text lives in the tooltip: inline
-                            // it overlapped the Zoom/Show All buttons when crowded.
                             if ui
-                                .small_button("✕ Close")
+                                .button("✕ Close")
                                 .on_hover_text(
-                                    "Hide the editing timeline\ndrag = select • click = playhead • Space = play • Del = delete",
+                                    "Hide the editing timeline (the video and clips are kept)",
                                 )
                                 .clicked()
                             {
@@ -2809,38 +3065,93 @@ impl eframe::App for ScreenRecorderApp {
                     // Transport.
                     ui.horizontal(|ui| {
                         ui.add_enabled_ui(has_timeline && !is_rec, |ui| {
-                            if ui.small_button("⏮").on_hover_text("Go to start").clicked() {
-                                self.timeline_state.playhead = Some(0.0);
-                                self.timeline_state.is_playing = false;
-                                self.playback_started = None;
+                            if ui
+                                .add(theme::icon_btn("⏮"))
+                                .on_hover_text("Go to start (or to the selection start)")
+                                .clicked()
+                            {
+                                self.stop_playback();
+                                // With a range selected, "start" is its head.
+                                let target = self
+                                    .timeline_state
+                                    .get_selection()
+                                    .filter(|(s, e)| e - s > 0.05)
+                                    .map(|(s, _)| s)
+                                    .unwrap_or(0.0);
+                                self.timeline_state.playhead = Some(target);
                             }
-                            if ui.small_button(if playing { "⏸" } else { "▶" }).on_hover_text("Play / pause preview (Space)").clicked() {
+                            let range_selected = self
+                                .timeline_state
+                                .get_selection()
+                                .is_some_and(|(s, e)| e - s > 0.05);
+                            let play_hint = if range_selected {
+                                "Play only the selected range (Space)"
+                            } else {
+                                "Play / pause preview (Space)"
+                            };
+                            if ui
+                                .add(theme::icon_btn(if playing { "⏸" } else { "▶" }))
+                                .on_hover_text(play_hint)
+                                .clicked()
+                            {
                                 self.toggle_play();
                             }
-                            if ui.small_button("⏹").on_hover_text("Stop").clicked() {
+                            if ui
+                                .add(theme::icon_btn("⏹"))
+                                .on_hover_text("Stop playback (Space)")
+                                .clicked()
+                            {
                                 self.stop_playback();
                             }
                         });
                         let cur = self.timeline_state.playhead.unwrap_or(0.0);
-                        ui.label(egui::RichText::new(format!(
-                            "{} / {}",
-                            crate::ui::format_tc(cur),
-                            crate::ui::format_tc(total)
-                        )).monospace());
-                        ui.weak(format!("Total duration: {}", format_duration(Duration::from_secs_f64(total.max(0.0)))));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                crate::ui::format_tc(cur),
+                                crate::ui::format_tc(total)
+                            ))
+                            .monospace(),
+                        )
+                        .on_hover_text("Playhead / total duration");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Total duration: {}",
+                                format_duration(Duration::from_secs_f64(total.max(0.0)))
+                            ))
+                            .color(theme::TEXT_DIM),
+                        );
+                        ui.label(
+                            egui::RichText::new("Space play • Del delete • +/− zoom • drag select")
+                                .color(theme::TEXT_DIM)
+                                .small(),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Open folder").clicked() {
+                            if ui
+                                .button("Open folder")
+                                .on_hover_text("Open the folder containing the last export")
+                                .clicked()
+                            {
                                 if let Some(parent) = self.output_path.parent() {
                                     let _ = std::process::Command::new("explorer").arg(parent).spawn();
                                 }
                             }
-                            ui.weak(format!(
-                                "Clips: {} • Thumbs: {}",
-                                self.timeline.segments.len(),
-                                self.filmstrip.len()
-                            ));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Clips: {} • Thumbs: {}",
+                                    self.timeline.segments.len(),
+                                    self.filmstrip.len()
+                                ))
+                                .color(theme::TEXT_DIM),
+                            );
                             let mut zoom = self.timeline_state.zoom;
-                            ui.add(egui::Slider::new(&mut zoom, 1.0..=20.0).show_value(false));
+                            let zoom_label = format!("{:.0}×", zoom);
+                            ui.add(
+                                egui::Slider::new(&mut zoom, 1.0..=20.0)
+                                    .show_value(false)
+                                    .text(zoom_label),
+                            )
+                            .on_hover_text("Timeline zoom (also + / − with the editor focused)");
                             self.timeline_state.zoom = zoom;
                             self.timeline_state.clamp_view(total.max(0.1));
                         });
@@ -2854,16 +3165,13 @@ impl eframe::App for ScreenRecorderApp {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(Color32::from_rgb(246, 248, 252))
+                        .fill(theme::PANEL_CENTER)
                         .inner_margin(egui::Margin::same(8.0)),
                 )
                 .show(ctx, |ui| {
                 egui::Frame::group(ui.style())
-                    .fill(Color32::WHITE)
-                    .stroke(egui::Stroke::new(
-                        1.5_f32,
-                        Color32::from_rgb(59, 130, 246),
-                    ))
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.5_f32, theme::ACCENT))
                     .rounding(egui::Rounding::same(12.0))
                     .show(ui, |ui| {
                     if self.is_recording() {
@@ -2875,13 +3183,13 @@ impl eframe::App for ScreenRecorderApp {
                             show_preview_fit(ui, id, aspect, 1.0);
                         } else {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 220.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(226, 232, 240));
+                            ui.painter().rect_filled(rect, 8.0, theme::PLACEHOLDER_BG);
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "Waiting for first frame…",
                                 egui::FontId::proportional(14.0),
-                                Color32::from_rgb(100, 116, 139),
+                                theme::TEXT_DIM,
                             );
                         }
                     } else {
@@ -2957,10 +3265,7 @@ impl eframe::App for ScreenRecorderApp {
                         };
 
                         ui.horizontal(|ui| {
-                            ui.heading(
-                                egui::RichText::new("👁 Preview")
-                                    .color(Color32::from_rgb(29, 78, 216)),
-                            );
+                            ui.heading(theme::heading("👁 Preview"));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if self.timeline_state.is_playing {
                                     if let Some(ph) = self.timeline_state.playhead {
@@ -2969,30 +3274,39 @@ impl eframe::App for ScreenRecorderApp {
                                         ui.label(egui::RichText::new("▶ playing").strong());
                                     }
                                 } else if show_still {
-                                    ui.weak("last take");
+                                    ui.label(egui::RichText::new("last take").color(theme::TEXT_DIM));
                                 } else if scrub_still.is_some() {
-                                    ui.weak("scrub HD");
+                                    ui.label(egui::RichText::new("scrub HD").color(theme::TEXT_DIM));
                                 } else if let Some(ph) = self.timeline_state.playhead {
                                     if !self.filmstrip.is_empty() {
-                                        ui.weak(format!("scrub {}", crate::ui::format_tc(ph)));
+                                        ui.label(egui::RichText::new(format!("scrub {}", crate::ui::format_tc(ph))).color(theme::TEXT_DIM));
                                     } else {
-                                        ui.weak("no signal");
+                                        ui.label(egui::RichText::new("no signal").color(theme::TEXT_DIM));
                                     }
                                 } else {
-                                    ui.weak("no signal");
+                                    ui.label(egui::RichText::new("no signal").color(theme::TEXT_DIM));
+                                }
+                                // Current zoom level — only when actually magnified,
+                                // so the default "fit" view stays clean.
+                                if self.preview_zoom > 1.01 {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.0}%", self.preview_zoom * 100.0))
+                                            .color(theme::ACCENT_DARK)
+                                            .strong(),
+                                    );
                                 }
                                 // Right-to-left: added later = further left, so
                                 // the buttons sit left of the status label.
-                                ui.small_button("+")
-                                    .on_hover_text("Zoom in")
+                                ui.add(theme::icon_btn("+"))
+                                    .on_hover_text("Zoom in (up to 800%)")
                                     .clicked()
                                     .then(|| self.preview_zoom = (self.preview_zoom * 1.4).min(8.0));
-                                ui.small_button("⛶")
-                                    .on_hover_text("Fit preview (default)")
+                                ui.add(theme::icon_btn("⛶"))
+                                    .on_hover_text("Fit preview (100%)")
                                     .clicked()
                                     .then(|| self.preview_zoom = 1.0);
-                                ui.small_button("−")
-                                    .on_hover_text("Zoom out")
+                                ui.add(theme::icon_btn("−"))
+                                    .on_hover_text("Zoom out (min 100%)")
                                     .clicked()
                                     .then(|| self.preview_zoom = (self.preview_zoom / 1.4).max(1.0));
                             });
@@ -3023,13 +3337,13 @@ impl eframe::App for ScreenRecorderApp {
                             }
                         } else {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 220.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(226, 232, 240));
+                            ui.painter().rect_filled(rect, 8.0, theme::PLACEHOLDER_BG);
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "No video at this position",
                                 egui::FontId::proportional(14.0),
-                                Color32::from_rgb(100, 116, 139),
+                                theme::TEXT_DIM,
                             );
                         }
                     }
@@ -3039,7 +3353,11 @@ impl eframe::App for ScreenRecorderApp {
                 if !self.show_editor && !self.is_recording() && has_recorded_video {
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
-                        if ui.button("✂ Edit video").on_hover_text("Show the editing timeline").clicked() {
+                        if ui
+                            .add(theme::primary_btn("✂ Edit video"))
+                            .on_hover_text("Show the editing timeline (cut, trim, fades)")
+                            .clicked()
+                        {
                             self.open_editor();
                         }
                     });
@@ -3050,29 +3368,49 @@ impl eframe::App for ScreenRecorderApp {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(Color32::from_rgb(239, 246, 255))
+                        .fill(theme::PANEL_TOOLBAR)
                         .inner_margin(egui::Margin::same(8.0)),
                 )
                 .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.heading(
-                        egui::RichText::new("🐦 Pipit Screen Recorder")
-                            .color(Color32::from_rgb(29, 78, 216)),
-                    );
-                    ui.add_space(8.0);
+                    ui.add_space(48.0);
+                    ui.heading(theme::heading("🐦 Pipit Screen Recorder"));
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new("No video recorded yet")
-                            .color(Color32::from_rgb(219, 39, 119)),
+                            .color(theme::BRAND)
+                            .size(16.0),
                     );
-                    ui.add_space(4.0);
-                    ui.label("Select a source and press ● Record to start");
+                    ui.add_space(6.0);
+                    theme::hint(ui, "Pick a source in the toolbar, then record.");
+                    ui.add_space(18.0);
+                    // The primary action lives here too — an empty screen
+                    // should offer the obvious next step instead of just
+                    // describing it.
+                    let rec = theme::record_btn("●  Record now");
+                    if ui.add_sized([170.0, 40.0], rec).clicked() {
+                        if let Err(e) = self.start_recording(ctx) {
+                            self.error_message = Some(e);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    theme::hint(ui, "Esc stops a recording");
                 });
             });
         }
 
         // Shortcuts apply to the editing timeline, so only when visible.
-        if self.show_editor {
+        // `wants_keyboard_input` keeps Space/+/- from firing while a slider,
+        // drag value or text field has keyboard focus.
+        let typing = ctx.wants_keyboard_input();
+        if (self.show_settings || self.show_volume_popup)
+            && !typing
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.show_settings = false;
+            self.show_volume_popup = false;
+        }
+        if self.show_editor && !typing {
             if ctx.input(|i| i.key_pressed(egui::Key::Delete)) && self.timeline_state.has_selection() {
                 self.cut_selected_range();
             }
@@ -3105,32 +3443,43 @@ impl eframe::App for ScreenRecorderApp {
             egui::Window::new("Settings")
                 .open(&mut open)
                 .resizable(true)
+                .default_width(360.0)
+                .min_size([320.0, 260.0])
                 .show(ctx, |ui| {
-                    ui.heading("Video");
+                    ui.heading(theme::heading("Video"));
                     ui.add(egui::Slider::new(&mut fps, 15..=60).text("FPS"));
                     ui.separator();
-                    ui.heading("Audio");
+                    ui.heading(theme::heading("Audio"));
                     ui.checkbox(&mut rec_sys, "Record system sound");
                     ui.checkbox(&mut rec_mic, "Record microphone");
                     ui.add(egui::Slider::new(&mut sys_vol, 0.0..=1.5).text("System volume"));
                     ui.add(egui::Slider::new(&mut mic_vol, 0.0..=1.5).text("Mic volume"));
-                    if ui.small_button("Rescan audio devices").clicked() {
+                    if ui
+                        .button("Rescan audio devices")
+                        .on_hover_text("Re-plugged a mic or speaker? Rescan to pick it up")
+                        .clicked()
+                    {
                         rescan = true;
                     }
-                    ui.label(format!("Mic: {}", mic_name));
+                    ui.label(egui::RichText::new(format!("Mic: {}", theme::truncate(&mic_name, 44))).color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("Mic: {mic_name}"));
                     ui.separator();
-                    ui.heading("Output");
-                    ui.label(format!("Folder: {}", out_folder));
+                    ui.heading(theme::heading("Output"));
+                    ui.label(egui::RichText::new(format!("Folder: {}", theme::truncate(&out_folder, 48))).color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("Folder: {out_folder}"));
                     ui.add_enabled_ui(!rec_locked, |ui| {
                         if ui.button("Browse…").on_hover_text("Choose where new recordings are saved").clicked() {
                             browse_output = true;
                         }
                     });
                     if rec_locked {
-                        ui.weak("Locked while recording.");
+                        theme::hint(ui, "Locked while recording.");
                     }
                     ui.separator();
-                    ui.weak("Pipit Screen Recorder — Rust + egui • video via windows-capture + ffmpeg • audio via WASAPI");
+                    theme::hint(
+                        ui,
+                        "Pipit Screen Recorder — Rust + egui • video via windows-capture + ffmpeg • audio via WASAPI",
+                    );
                 });
             self.show_settings = open;
             self.target_fps = fps;
@@ -3157,12 +3506,14 @@ impl eframe::App for ScreenRecorderApp {
             egui::Window::new("🔊 Volume")
                 .open(&mut open)
                 .resizable(false)
+                .default_width(300.0)
                 .show(ctx, |ui| {
                     ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("Master volume"));
                     ui.add(egui::Slider::new(&mut fi, 0.0..=5.0).text("Fade in (s)"));
                     ui.add(egui::Slider::new(&mut fo, 0.0..=5.0).text("Fade out (s)"));
-                    ui.weak(format!("Timeline: {:.1}s", total));
-                    ui.weak("Applied when you press Save and Close.");
+                    ui.separator();
+                    theme::hint(ui, format!("Timeline: {:.1}s", total));
+                    theme::hint(ui, "Applied when you press Save and Close.");
                 });
             self.show_volume_popup = open;
             self.master_volume = vol;
@@ -3170,6 +3521,15 @@ impl eframe::App for ScreenRecorderApp {
             self.fade_out = fo;
         }
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // Repaint budget: hold 60 fps only while something is actually
+        // animating (live capture, playback, a scrub decode in flight, the
+        // area-selector overlay). An idle editor drops to ~4 fps — egui
+        // still repaints instantly on any input, so nothing feels laggy and
+        // the loop stops burning CPU when the app is just sitting there.
+        let animating = self.is_recording()
+            || self.timeline_state.is_playing
+            || self.still_rx.is_some()
+            || self.show_area_selector;
+        ctx.request_repaint_after(Duration::from_millis(if animating { 16 } else { 250 }));
     }
 }

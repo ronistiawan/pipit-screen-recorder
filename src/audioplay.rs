@@ -46,10 +46,11 @@ pub struct PreviewAudio {
 }
 
 impl PreviewAudio {
-    /// Start playing `segments` from timeline second `from`.
+    /// Start playing `segments` from timeline second `from`, stopping at
+    /// timeline second `until` (a selected range plays only itself).
     /// Returns `None` when there is no usable output device — playback then
     /// continues silently instead of failing.
-    pub fn start(segments: Vec<PlaySegment>, from: f64) -> Option<PreviewAudio> {
+    pub fn start(segments: Vec<PlaySegment>, from: f64, until: f64) -> Option<PreviewAudio> {
         if segments.is_empty() {
             return None;
         }
@@ -82,7 +83,7 @@ impl PreviewAudio {
         let thread_shared = shared.clone();
         let handle = std::thread::Builder::new()
             .name("preview-audio".into())
-            .spawn(move || decode_loop(thread_shared, segments, from, rate, channels))
+            .spawn(move || decode_loop(thread_shared, segments, from, until, rate, channels))
             .ok()?;
 
         Some(PreviewAudio {
@@ -233,11 +234,12 @@ fn push_frame(shared: &Shared, buf: &[u8], channels: usize) -> bool {
     }
 }
 
-/// Decode every segment after `from` into the shared ring until EOF or stop.
+/// Decode every segment in `[from, until)` into the shared ring until EOF or stop.
 fn decode_loop(
     shared: Arc<Shared>,
     segments: Vec<PlaySegment>,
     from: f64,
+    until: f64,
     rate: u32,
     channels: usize,
 ) {
@@ -247,13 +249,14 @@ fn decode_loop(
         if shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        if seg.timeline_end <= from {
+        if seg.timeline_end <= from || seg.timeline_start >= until {
             continue;
         }
         // Timeline -> source mapping (segments preserve duration 1:1).
         let offset = (from - seg.timeline_start).max(0.0);
         let src_from = seg.source_start + offset;
-        let dur = seg.source_end - src_from;
+        let tl_from = seg.timeline_start + offset;
+        let dur = (seg.source_end - src_from).min((until - tl_from).max(0.0));
         if dur <= 0.01 {
             continue;
         }
@@ -355,7 +358,7 @@ mod tests {
 
         let h = {
             let shared = shared.clone();
-            std::thread::spawn(move || decode_loop(shared, vec![seg], 0.0, 48000, 2))
+            std::thread::spawn(move || decode_loop(shared, vec![seg], 0.0, 1.0, 48000, 2))
         };
 
         // Wait for the first ~0.2s of audio to arrive.

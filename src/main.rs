@@ -6,6 +6,7 @@ mod encoder;
 mod icon;
 mod player;
 mod timeline;
+mod theme;
 mod ui;
 
 use app::ScreenRecorderApp;
