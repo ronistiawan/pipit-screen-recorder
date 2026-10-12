@@ -30,6 +30,15 @@ pub const TINT_GREEN_FILL: Color32 = Color32::from_rgb(236, 253, 245); // emeral
 pub const TINT_GREEN_BORDER: Color32 = Color32::from_rgb(167, 243, 208); // emerald-200
 /// Toggle-switch track when off.
 pub const TOGGLE_OFF: Color32 = Color32::from_rgb(203, 213, 225); // slate-300
+/// Timeline waveform bar grades, quiet → hot.
+pub const WAVE_QUIET: Color32 = Color32::from_rgb(165, 180, 252); // indigo-300
+pub const WAVE_MID: Color32 = Color32::from_rgb(129, 140, 248); // indigo-400
+pub const WAVE_LOUD: Color32 = Color32::from_rgb(79, 70, 229); // indigo-600
+pub const WAVE_HOT: Color32 = Color32::from_rgb(244, 63, 94); // rose-500
+/// Soft halo washed behind each waveform bar for depth.
+pub fn wave_wash() -> Color32 {
+    Color32::from_rgba_unmultiplied(99, 102, 241, 26)
+}
 
 // ---------- surfaces ----------
 pub const SURFACE: Color32 = Color32::WHITE;
@@ -47,7 +56,6 @@ pub const SUBTLE_BG: Color32 = Color32::from_rgb(241, 245, 249); // slate-100
 pub const BORDER: Color32 = Color32::from_rgb(203, 213, 225); // slate-300
 pub const BORDER_SOFT: Color32 = Color32::from_rgb(226, 232, 240); // slate-200
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(148, 163, 184); // slate-400
-pub const CARD_BLUE: Color32 = Color32::from_rgb(147, 197, 253);
 pub const CARD_AMBER: Color32 = Color32::from_rgb(253, 224, 71);
 /// Soft status-pill fills (state badges in the setup sidebar). Pair with the
 /// existing `SUBTLE_BG` (slate) and `ACCENT_SOFT` (blue) for the other states.

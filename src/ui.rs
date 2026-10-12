@@ -436,30 +436,61 @@ pub fn draw_timeline(
     );
     if !tracks.waveform.is_empty() && tracks.waveform_rate > 0.0 {
         let rate = tracks.waveform_rate;
-        let i0 = ((vs * rate).floor() as usize).saturating_sub(1);
-        let i1 = ((ve * rate).ceil() as usize + 1).min(tracks.waveform.len());
-        let buckets = (i1.saturating_sub(i0)).max(1);
-        let px_per = audio_rect.width() / buckets as f32;
-        for (k, &v) in tracks.waveform.iter().enumerate().take(i1).skip(i0) {
-            let tc = (k as f64 + 0.5) / rate;
-            let x = time_to_x(tc);
-            if x < audio_rect.left() || x > audio_rect.right() {
-                continue;
+        // Peak-preserving decimation: one rounded bar per few pixels, so a
+        // fully zoomed-out hour of audio draws ~300 pills instead of ~70k
+        // hairlines — faster and much easier on the eyes.
+        let slot = 4.0_f32;
+        let x_start = audio_rect.left().max(time_to_x(vs));
+        let x_end = audio_rect.right().min(time_to_x(ve));
+        let bar_w = (slot * 0.62).clamp(1.5, 5.0);
+        let rounding = bar_w * 0.5;
+        let mut x = x_start;
+        while x < x_end {
+            let xa = x;
+            let xb = (x + slot).min(x_end);
+            let b0 = (x_to_time(xa) * rate).floor().max(0.0) as usize;
+            let b1 = (x_to_time(xb) * rate).ceil().max(0.0) as usize;
+            let b1 = b1.min(tracks.waveform.len());
+            let mut amp = 0.0_f32;
+            if b0 < b1 {
+                for &v in &tracks.waveform[b0..b1] {
+                    amp = amp.max(v);
+                }
+            } else if let Some(&v) = tracks.waveform.get(b0) {
+                amp = v;
             }
-            let amp = v.clamp(0.0, 1.0);
-            if amp < 0.008 {
-                continue;
+            let amp = amp.clamp(0.0, 1.0);
+            if amp >= 0.008 {
+                let cx = (xa + xb) * 0.5;
+                let h = (amp * half).max(2.5);
+                let col = if amp >= 0.85 {
+                    theme::WAVE_HOT
+                } else if amp >= 0.45 {
+                    theme::WAVE_LOUD
+                } else if amp >= 0.12 {
+                    theme::WAVE_MID
+                } else {
+                    theme::WAVE_QUIET
+                };
+                // Soft halo first (depth), crisp graded pill on top.
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(cx - bar_w * 0.5 - 1.5, mid - h - 1.0),
+                        Pos2::new(cx + bar_w * 0.5 + 1.5, mid + h + 1.0),
+                    ),
+                    rounding + 1.0,
+                    theme::wave_wash(),
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(cx - bar_w * 0.5, mid - h),
+                        Pos2::new(cx + bar_w * 0.5, mid + h),
+                    ),
+                    rounding,
+                    col,
+                );
             }
-            let h = (amp * half).max(1.0);
-            let col = if amp < 0.12 {
-                theme::CARD_BLUE
-            } else {
-                theme::METER_BLUE
-            };
-            painter.line_segment(
-                [Pos2::new(x, mid - h), Pos2::new(x, mid + h)],
-                Stroke::new(px_per.clamp(1.0, 3.0), col),
-            );
+            x = xb;
         }
     } else if !is_recording && timeline.segments.is_empty() {
         painter.text(
@@ -470,13 +501,21 @@ pub fn draw_timeline(
             text_c,
         );
     }
-    // Fade overlays.
+    // Fade overlays: light wash + an automation-style ramp line so the
+    // fade reads as a curve, not a stain.
     if tracks.fade_in > 0.05 && full_total > 0.0 {
         let x = time_to_x(tracks.fade_in).min(audio_rect.right());
         painter.rect_filled(
             Rect::from_min_max(audio_rect.min, Pos2::new(x, audio_rect.bottom())),
             0.0,
-            Color32::from_rgba_unmultiplied(255, 200, 60, 60),
+            Color32::from_rgba_unmultiplied(245, 158, 11, 26),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(audio_rect.left(), audio_rect.bottom() - 3.0),
+                Pos2::new(x, audio_rect.top() + 3.0),
+            ],
+            Stroke::new(1.5_f32, theme::PAUSED),
         );
         painter.text(
             Pos2::new(audio_rect.left() + 3.0, audio_rect.top() + 2.0),
@@ -491,7 +530,14 @@ pub fn draw_timeline(
         painter.rect_filled(
             Rect::from_min_max(Pos2::new(x, audio_rect.top()), audio_rect.max),
             0.0,
-            Color32::from_rgba_unmultiplied(255, 200, 60, 60),
+            Color32::from_rgba_unmultiplied(245, 158, 11, 26),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(x, audio_rect.top() + 3.0),
+                Pos2::new(audio_rect.right(), audio_rect.bottom() - 3.0),
+            ],
+            Stroke::new(1.5_f32, theme::PAUSED),
         );
         painter.text(
             Pos2::new(audio_rect.right() - 3.0, audio_rect.top() + 2.0),
