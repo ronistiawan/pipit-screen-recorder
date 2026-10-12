@@ -2422,8 +2422,8 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.text_cursor.stroke = egui::Stroke::new(2.0_f32, th::ACCENT);
 
     // ---- rounded corners everywhere ----
-    visuals.window_rounding = egui::Rounding::same(12.0);
-    visuals.menu_rounding = egui::Rounding::same(10.0);
+    visuals.window_rounding = egui::Rounding::same(14.0);
+    visuals.menu_rounding = egui::Rounding::same(12.0);
     visuals.widgets.noninteractive.rounding = egui::Rounding::same(th::RADIUS);
     visuals.widgets.inactive.rounding = egui::Rounding::same(th::RADIUS);
     visuals.widgets.hovered.rounding = egui::Rounding::same(th::RADIUS);
@@ -2468,7 +2468,7 @@ fn apply_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     // Minimum hit target: plain (non-`small`) widgets — checkbox, slider
     // handles, DragValue, regular buttons — never get shorter than this.
@@ -2479,19 +2479,137 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Thin audio level meter. Drawn directly under its channel's volume slider
-/// (the slider row above identifies the channel), spanning the remaining card
-/// width so the two meters line up column-wise.
-fn level_bar(ui: &mut egui::Ui, label: &str, level: f32, color: Color32) {
-    let bar_w = ui.available_width().max(40.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
-    resp.on_hover_text(format!("{label} level: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
-    ui.painter().rect_filled(rect, 3.0, theme::METER_TRACK);
-    let w = (rect.width() * level.clamp(0.0, 1.0)).max(if level > 0.01 { 3.0 } else { 0.0 });
-    if w > 0.0 {
-        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()));
-        ui.painter().rect_filled(fill, 3.0, color);
+/// Modern volume slider: a slim rounded track with an accent fill and a
+/// floating white thumb. Click or drag anywhere on the row to set the value.
+///
+/// Unlike `egui::Slider` there is no trailing DragValue box eating horizontal
+/// space — the value lives in the channel header as a `%` badge — so the row
+/// can safely span the full card width without overflowing it.
+fn volume_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    max: f32,
+    accent: Color32,
+) -> egui::Response {
+    let h = 24.0_f32;
+    let w = ui.available_width().max(60.0);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            // Inset by the thumb radius so the thumb centre maps exactly.
+            let pad = 9.0_f32;
+            let x0 = rect.left() + pad;
+            let x1 = rect.right() - pad;
+            let t = ((p.x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+            *value = (t * max).clamp(0.0, max);
+            resp.mark_changed();
+        }
     }
+    let enabled = ui.is_enabled();
+    let t = (*value / max).clamp(0.0, 1.0);
+    let painter = ui.painter_at(rect);
+    let mid = rect.center().y;
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), mid - 3.5),
+        egui::pos2(rect.right(), mid + 3.5),
+    );
+    painter.rect_filled(track_rect, 3.5, theme::METER_TRACK);
+    let pad = 9.0_f32;
+    let x0 = rect.left() + pad;
+    let cx = x0 + t * ((rect.right() - pad) - x0).max(0.0);
+    if cx > rect.left() + 1.0 {
+        let fill_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), mid - 3.5),
+            egui::pos2(cx.max(rect.left() + 7.0), mid + 3.5),
+        );
+        painter.rect_filled(
+            fill_rect,
+            3.5,
+            if enabled { accent } else { theme::BORDER_STRONG },
+        );
+    }
+    // Thumb: soft shadow + white knob + accent ring, grows on hover/drag.
+    let hovered = resp.hovered() || resp.dragged();
+    let r = if hovered { 8.5 } else { 7.5 };
+    let center = egui::pos2(cx.clamp(rect.left() + pad, rect.right() - pad), mid);
+    painter.circle_filled(center, r + 1.5, Color32::from_black_alpha(28));
+    painter.circle_filled(center, r, Color32::WHITE);
+    painter.circle_stroke(
+        center,
+        r,
+        egui::Stroke::new(2.0_f32, if enabled { accent } else { theme::BORDER_STRONG }),
+    );
+    resp.on_hover_text(format!("Volume {:.0}% — drag to adjust", t * 100.0))
+}
+
+/// Slim live-level meter that sits under its channel's slider.
+fn mini_meter(ui: &mut egui::Ui, level: f32, accent: Color32) {
+    let bar_w = ui.available_width().max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(bar_w, 5.0), egui::Sense::hover());
+    resp.on_hover_text(format!("Live level: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
+    ui.painter().rect_filled(rect, 2.5, theme::METER_TRACK);
+    let lvl = level.clamp(0.0, 1.0);
+    let w = (rect.width() * lvl).max(if lvl > 0.01 { 5.0 } else { 0.0 });
+    if w > 0.0 {
+        // Shift to red when clipping so a hot mic is obvious at a glance.
+        let col = if lvl > 0.95 { theme::REC_SOFT } else { accent };
+        ui.painter()
+            .rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height())), 2.5, col);
+    }
+}
+
+/// One audio mixer channel: tinted strip with a toggle + name + `%` badge on
+/// top, the modern slider in the middle and a live meter at the bottom.
+///
+/// `enabled` / `volume` are the channel's state, `level` its current live
+/// input (0..1). Everything is sized from `available_width()` with no trailing
+/// value box, so the strip can never push the sidebar wider.
+#[allow(clippy::too_many_arguments)]
+fn audio_channel(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+    volume: &mut f32,
+    level: f32,
+    title: &str,
+    subtitle: &str,
+    accent: Color32,
+    fill: Color32,
+    border: Color32,
+    id_salt: &str,
+) {
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0_f32, border))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::toggle(ui, &mut *enabled, id_salt, accent);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).small().strong().color(theme::TEXT));
+                    ui.label(egui::RichText::new(subtitle).small().color(theme::TEXT_DIM));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Percent badge doubles as a precise editor (drag / type).
+                    let mut pct = (*volume / 1.5 * 100.0).round();
+                    let badge = ui.add(
+                        egui::DragValue::new(&mut pct)
+                            .range(0.0..=150.0)
+                            .speed(1.0)
+                            .suffix("%"),
+                    );
+                    if badge.changed() {
+                        *volume = (pct / 100.0 * 1.5).clamp(0.0, 1.5);
+                    }
+                    badge.on_hover_text("Volume — drag or type a percent (100% = ×1.00)");
+                });
+            });
+            ui.add_enabled_ui(*enabled, |ui| {
+                volume_slider(ui, volume, 1.5, accent);
+                mini_meter(ui, if *enabled { level } else { 0.0 }, accent);
+            });
+        });
 }
 
 /// Draw `tex_id` (with `height / width == aspect`) as large as possible inside
@@ -2832,8 +2950,11 @@ impl eframe::App for ScreenRecorderApp {
             )
             .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading(
-                    egui::RichText::new("🐦 Pipit").color(theme::ACCENT_DARK),
+                ui.label(
+                    egui::RichText::new("🐦 Pipit")
+                        .color(theme::ACCENT_DARK)
+                        .size(19.0)
+                        .strong(),
                 );
                 ui.label(egui::RichText::new("screen recorder").color(theme::BRAND).small());
                 ui.separator();
@@ -3067,7 +3188,7 @@ impl eframe::App for ScreenRecorderApp {
                         // with the duration and folds the rest into one line
                         // instead of a five-row key/value table.
                         theme::card(ui, |ui| {
-                            theme::section_header(ui, "Recording", |ui| {
+                            theme::section_header(ui, "⏺ Recording", |ui| {
                                 let (text, fill, color) = match self.state {
                                     RecordingState::Idle => (
                                         "Idle",
@@ -3135,7 +3256,7 @@ impl eframe::App for ScreenRecorderApp {
 
                         // ---- audio ----
                         theme::card(ui, |ui| {
-                            theme::section_header(ui, "Audio", |ui| {
+                            theme::section_header(ui, "🔊 Audio", |ui| {
                                 if ui
                                     .small_button("⟳")
                                     .on_hover_text("Rescan audio devices")
@@ -3150,26 +3271,37 @@ impl eframe::App for ScreenRecorderApp {
                                 Some(cap) => (cap.system_level(), cap.mic_level()),
                                 None => (0.0, 0.0),
                             };
-                            // Each channel is a slider with its live meter
-                            // indented directly underneath, so the two are
-                            // read as one control instead of two lists.
-                            const LABEL_W: f32 = 52.0;
-                            // Width the Slider's trailing DragValue box needs
-                            // (0.00–1.50 at 2 decimals + padding). The bar
-                            // itself (`slider_width`) must leave this room:
-                            // giving the bar the full remaining width pushes
-                            // the value box past the card edge, the row
-                            // overflows, and every row below measures a wider
-                            // available_width and renders clipped.
-                            const VALUE_BOX_W: f32 = 56.0;
+                            // Modern mixer: one tinted channel strip per
+                            // source (toggle + name + `%` badge, custom
+                            // slider, live meter). No trailing DragValue
+                            // boxes, so nothing can push the card wider.
                             ui.add_enabled_ui(!rec, |ui| {
-                                ui.checkbox(
+                                let sys_on = self.record_system_audio;
+                                audio_channel(
+                                    ui,
                                     &mut self.record_system_audio,
-                                    egui::RichText::new("System sound (speakers)").small(),
+                                    &mut self.system_volume,
+                                    if sys_on { sys_lvl } else { 0.0 },
+                                    "System sound",
+                                    "Speakers / loopback",
+                                    theme::METER_BLUE,
+                                    theme::TINT_BLUE_FILL,
+                                    theme::TINT_BLUE_BORDER,
+                                    "audio_sys_toggle",
                                 );
-                                ui.checkbox(
+                                ui.add_space(2.0);
+                                let mic_on = self.record_mic;
+                                audio_channel(
+                                    ui,
                                     &mut self.record_mic,
-                                    egui::RichText::new("Microphone").small(),
+                                    &mut self.mic_volume,
+                                    if mic_on { mic_lvl } else { 0.0 },
+                                    "Microphone",
+                                    "Voice-over input",
+                                    theme::METER_GREEN,
+                                    theme::TINT_GREEN_FILL,
+                                    theme::TINT_GREEN_BORDER,
+                                    "audio_mic_toggle",
                                 );
                                 if self.record_mic {
                                     let mics = self.audio_devices.microphones.clone();
@@ -3178,7 +3310,7 @@ impl eframe::App for ScreenRecorderApp {
                                         .clone()
                                         .unwrap_or_else(|| "Default".into());
                                     egui::ComboBox::from_id_salt("mic_pick")
-                                        .selected_text(theme::truncate(&current, 28))
+                                        .selected_text(theme::truncate(&current, 24))
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(
                                                 &mut self.mic_device,
@@ -3193,62 +3325,6 @@ impl eframe::App for ScreenRecorderApp {
                                                 );
                                             }
                                         });
-                                }
-                                // Let the slider fill the card instead of a
-                                // fixed stub: the old rows needed ~235px in a
-                                // ~238px card, so the bar collapsed and the
-                                // handle overlapped the value box.
-                                ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        egui::vec2(LABEL_W, 18.0),
-                                        egui::Label::new(egui::RichText::new("System").small()),
-                                    );
-                                    // Subtract the inter-widget spacing AND the
-                                    // value box: available_width() is measured
-                                    // before the layout inserts spacing, and
-                                    // the Slider appends its DragValue after
-                                    // the bar. Skipping either makes the row
-                                    // (and, via PanelState, the whole panel)
-                                    // ratchet wider every frame.
-                                    let slider_w = (ui.available_width()
-                                        - ui.spacing().item_spacing.x
-                                        - VALUE_BOX_W)
-                                        .max(60.0);
-                                    ui.spacing_mut().slider_width = slider_w;
-                                    ui.add(
-                                        egui::Slider::new(&mut self.system_volume, 0.0..=1.5)
-                                            .fixed_decimals(2)
-                                            .step_by(0.05),
-                                    );
-                                });
-                                if self.record_system_audio {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
-                                        level_bar(ui, "System", sys_lvl, theme::METER_BLUE);
-                                    });
-                                }
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        egui::vec2(LABEL_W, 18.0),
-                                        egui::Label::new(egui::RichText::new("Mic").small()),
-                                    );
-                                    let slider_w = (ui.available_width()
-                                        - ui.spacing().item_spacing.x
-                                        - VALUE_BOX_W)
-                                        .max(60.0);
-                                    ui.spacing_mut().slider_width = slider_w;
-                                    ui.add(
-                                        egui::Slider::new(&mut self.mic_volume, 0.0..=1.5)
-                                            .fixed_decimals(2)
-                                            .step_by(0.05),
-                                    );
-                                });
-                                if self.record_mic {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
-                                        level_bar(ui, "Mic", mic_lvl, theme::METER_GREEN);
-                                    });
                                 }
                             });
                             if rec {
@@ -3283,7 +3359,7 @@ impl eframe::App for ScreenRecorderApp {
                         // Clip count/total moved into the header so the body
                         // only carries the active selection and its actions.
                         theme::card(ui, |ui| {
-                            theme::section_header(ui, "Selection", |ui| {
+                            theme::section_header(ui, "✂ Selection", |ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{} clips · {:.1}s",
@@ -3385,7 +3461,7 @@ impl eframe::App for ScreenRecorderApp {
                         // sidebar ends on one object instead of a card plus a
                         // dangling caption.
                         theme::card(ui, |ui| {
-                            theme::section_header(ui, "Save folder", |_| {});
+                            theme::section_header(ui, "📁 Save folder", |_| {});
                             let dir = self.output_dir.display().to_string();
                             ui.add(
                                 egui::Label::new(
@@ -3737,28 +3813,48 @@ impl eframe::App for ScreenRecorderApp {
                 )
                 .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(48.0);
-                    ui.heading(theme::heading("🐦 Pipit Screen Recorder"));
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("No video recorded yet")
-                            .color(theme::BRAND)
-                            .size(16.0),
-                    );
-                    ui.add_space(6.0);
-                    theme::hint(ui, "Pick a source in the toolbar, then record.");
-                    ui.add_space(18.0);
-                    // The primary action lives here too — an empty screen
-                    // should offer the obvious next step instead of just
-                    // describing it.
-                    let rec = theme::record_btn("●  Record now");
-                    if ui.add_sized([170.0, 40.0], rec).clicked() {
-                        if let Err(e) = self.start_recording(ctx) {
-                            self.error_message = Some(e);
-                        }
-                    }
-                    ui.add_space(6.0);
-                    theme::hint(ui, "Esc stops a recording");
+                    ui.add_space(40.0);
+                    // Hero card: soft indigo-tinted panel so the empty state
+                    // reads as a designed landing, not a blank page.
+                    egui::Frame::none()
+                        .fill(egui::Color32::WHITE)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_BORDER))
+                        .rounding(egui::Rounding::same(18.0))
+                        .inner_margin(egui::Margin::symmetric(36.0, 28.0))
+                        .show(ui, |ui| {
+                            ui.set_width(340.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("🐦").size(40.0));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Pipit Screen Recorder")
+                                        .color(theme::ACCENT_DARK)
+                                        .size(22.0)
+                                        .strong(),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new("No video recorded yet")
+                                        .color(theme::BRAND)
+                                        .size(15.0)
+                                        .strong(),
+                                );
+                                ui.add_space(4.0);
+                                theme::hint(ui, "Pick a source in the toolbar, then record.");
+                                ui.add_space(18.0);
+                                // The primary action lives here too — an empty
+                                // screen should offer the obvious next step
+                                // instead of just describing it.
+                                let rec = theme::record_btn("●  Record now");
+                                if ui.add_sized([190.0, 42.0], rec).clicked() {
+                                    if let Err(e) = self.start_recording(ctx) {
+                                        self.error_message = Some(e);
+                                    }
+                                }
+                                ui.add_space(8.0);
+                                theme::hint(ui, "Esc stops a recording");
+                            });
+                        });
                 });
             });
         }

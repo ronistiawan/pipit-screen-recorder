@@ -7,10 +7,10 @@
 use egui::{Color32, RichText, Stroke};
 
 // ---------- accent / brand ----------
-pub const ACCENT: Color32 = Color32::from_rgb(37, 99, 235); // blue-600
-pub const ACCENT_DARK: Color32 = Color32::from_rgb(29, 78, 216); // blue-700
-pub const ACCENT_SOFT: Color32 = Color32::from_rgb(219, 234, 254); // blue-100
-pub const ACCENT_BORDER: Color32 = Color32::from_rgb(191, 219, 254); // blue-200
+pub const ACCENT: Color32 = Color32::from_rgb(79, 70, 229); // indigo-600
+pub const ACCENT_DARK: Color32 = Color32::from_rgb(67, 56, 202); // indigo-700
+pub const ACCENT_SOFT: Color32 = Color32::from_rgb(224, 231, 255); // indigo-100
+pub const ACCENT_BORDER: Color32 = Color32::from_rgb(199, 210, 254); // indigo-200
 pub const BRAND: Color32 = Color32::from_rgb(219, 39, 119); // pink-600
 
 // ---------- status ----------
@@ -21,8 +21,15 @@ pub const OK: Color32 = Color32::from_rgb(56, 142, 60); // resume / continue fil
 pub const PAUSED: Color32 = Color32::from_rgb(217, 119, 6); // amber-600
 pub const WARN_TEXT: Color32 = Color32::from_rgb(180, 83, 9); // amber-700 (readable)
 pub const ERROR_TEXT: Color32 = Color32::from_rgb(185, 28, 28); // red-700 (readable)
-pub const METER_BLUE: Color32 = Color32::from_rgb(66, 133, 244);
-pub const METER_GREEN: Color32 = Color32::from_rgb(52, 187, 120);
+pub const METER_BLUE: Color32 = Color32::from_rgb(59, 130, 246);
+pub const METER_GREEN: Color32 = Color32::from_rgb(16, 185, 129);
+/// Soft channel tints for the audio mixer strips.
+pub const TINT_BLUE_FILL: Color32 = Color32::from_rgb(239, 246, 255); // blue-50
+pub const TINT_BLUE_BORDER: Color32 = Color32::from_rgb(191, 219, 254); // blue-200
+pub const TINT_GREEN_FILL: Color32 = Color32::from_rgb(236, 253, 245); // emerald-50
+pub const TINT_GREEN_BORDER: Color32 = Color32::from_rgb(167, 243, 208); // emerald-200
+/// Toggle-switch track when off.
+pub const TOGGLE_OFF: Color32 = Color32::from_rgb(203, 213, 225); // slate-300
 
 // ---------- surfaces ----------
 pub const SURFACE: Color32 = Color32::WHITE;
@@ -58,8 +65,9 @@ pub const BTN_H: f32 = 32.0;
 /// Minimum hit target for icon-ish buttons (`⟳`, `⏮`, `−`…).
 pub const ICON_BTN_H: f32 = 26.0;
 pub const ICON_BTN_W: f32 = 30.0;
-pub const RADIUS: f32 = 8.0;
-pub const CARD_GAP: f32 = 8.0;
+pub const RADIUS: f32 = 10.0;
+pub const CARD_RADIUS: f32 = 14.0;
+pub const CARD_GAP: f32 = 10.0;
 /// Shared outer margin for the top/bottom/center panels.
 pub fn panel_margin() -> egui::Margin {
     egui::Margin::symmetric(8.0, 6.0)
@@ -109,15 +117,15 @@ pub fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
-        .rounding(egui::Rounding::same(RADIUS))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .rounding(egui::Rounding::same(CARD_RADIUS))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             // Fill the parent width: short content (e.g. "D:\", two buttons)
             // would otherwise leave the card hugging its content while sibling
             // cards stretch full width.
             ui.set_width(ui.available_width());
             // Slightly airier rows than the old 4/3 — the card padding grew too.
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             body(ui);
         });
 }
@@ -134,11 +142,11 @@ pub fn section_header(
             RichText::new(title.into())
                 .small()
                 .strong()
-                .color(TEXT_MUTED),
+                .color(TEXT),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
     });
-    ui.add_space(1.0);
+    ui.add_space(2.0);
 }
 
 /// Rounded status pill for state badges (Idle / ● REC / Paused …).
@@ -150,6 +158,36 @@ pub fn pill(ui: &mut egui::Ui, text: &str, fill: Color32, text_color: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).color(text_color).small().strong());
         });
+}
+
+/// Modern toggle switch (a friendlier checkbox). The knob slides with a
+/// short animation via `animate_bool`, so it feels alive without any manual
+/// repaint bookkeeping — egui repaints while the animation runs.
+pub fn toggle(ui: &mut egui::Ui, on: &mut bool, id_salt: &str, accent: Color32) -> egui::Response {
+    let w = 36.0_f32;
+    let h = 20.0_f32;
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    // 0 = off … 1 = on, animated.
+    let t = ui.ctx().animate_bool(egui::Id::new(id_salt), *on);
+    let enabled = ui.is_enabled();
+    let track = if !enabled {
+        METER_TRACK
+    } else if t > 0.5 {
+        if t >= 0.999 { accent } else { accent.lerp_to_gamma(TOGGLE_OFF, 1.0 - t) }
+    } else {
+        TOGGLE_OFF
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, h / 2.0, track);
+    let r = h / 2.0 - 2.5;
+    let cx = rect.left() + h / 2.0 + t * (rect.width() - h);
+    painter.circle_filled(egui::pos2(cx, rect.center().y), r + 1.0, Color32::from_black_alpha(24));
+    painter.circle_filled(egui::pos2(cx, rect.center().y), r, Color32::WHITE);
+    resp.on_hover_text(if *on { "On — click to turn off" } else { "Off — click to turn on" })
 }
 
 /// Muted hint line (instructions, secondary info) at readable contrast —
