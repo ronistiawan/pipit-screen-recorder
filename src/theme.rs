@@ -41,13 +41,11 @@ pub const BORDER: Color32 = Color32::from_rgb(203, 213, 225); // slate-300
 pub const BORDER_SOFT: Color32 = Color32::from_rgb(226, 232, 240); // slate-200
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(148, 163, 184); // slate-400
 pub const CARD_BLUE: Color32 = Color32::from_rgb(147, 197, 253);
-pub const CARD_GREEN: Color32 = Color32::from_rgb(110, 231, 183);
 pub const CARD_AMBER: Color32 = Color32::from_rgb(253, 224, 71);
-pub const CARD_VIOLET: Color32 = Color32::from_rgb(196, 181, 253);
-/// Readable counterparts of the card border pastels, used for card titles
-/// (the pastels themselves fail contrast as text).
-pub const CARD_TEXT_GREEN: Color32 = Color32::from_rgb(5, 150, 105); // emerald-600
-pub const CARD_TEXT_VIOLET: Color32 = Color32::from_rgb(124, 58, 237); // violet-600
+/// Soft status-pill fills (state badges in the setup sidebar). Pair with the
+/// existing `SUBTLE_BG` (slate) and `ACCENT_SOFT` (blue) for the other states.
+pub const PILL_RED: Color32 = Color32::from_rgb(254, 242, 242); // red-50
+pub const PILL_AMBER: Color32 = Color32::from_rgb(254, 243, 199); // amber-100
 
 // ---------- text ----------
 pub const TEXT: Color32 = Color32::from_rgb(15, 23, 42); // slate-900
@@ -61,7 +59,7 @@ pub const BTN_H: f32 = 32.0;
 pub const ICON_BTN_H: f32 = 26.0;
 pub const ICON_BTN_W: f32 = 30.0;
 pub const RADIUS: f32 = 8.0;
-pub const CARD_GAP: f32 = 6.0;
+pub const CARD_GAP: f32 = 8.0;
 /// Shared outer margin for the top/bottom/center panels.
 pub fn panel_margin() -> egui::Margin {
     egui::Margin::symmetric(8.0, 6.0)
@@ -99,47 +97,59 @@ pub fn icon_btn(label: impl Into<String>) -> egui::Button<'static> {
 }
 
 // ---------- cards ----------
-/// White card with a colored hairline border. The closure draws the whole
-/// card (title row included) so only one `&mut self` capture is live at a
-/// time — egui's sibling closures would otherwise fight over the borrow.
-pub fn card(ui: &mut egui::Ui, border: Color32, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
+/// Neutral section card: white fill, soft slate hairline, roomier padding.
+/// Every sidebar section shares this one chrome so the panel reads as a
+/// single column — color is reserved for *state* (pills, meters, warnings)
+/// instead of being spent on decoration.
+///
+/// The closure draws the whole card (header included) so only one `&mut self`
+/// capture is live at a time — egui's sibling closures would otherwise fight
+/// over the borrow.
+pub fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, border))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(6.0))
+        .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+        .rounding(egui::Rounding::same(RADIUS))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
-            // Tighter rows inside cards so the sidebar fits without scrolling
-            // on short windows.
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
+            // Fill the parent width: short content (e.g. "D:\", two buttons)
+            // would otherwise leave the card hugging its content while sibling
+            // cards stretch full width.
+            ui.set_width(ui.available_width());
+            // Slightly airier rows than the old 4/3 — the card padding grew too.
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
             body(ui);
         });
 }
 
-/// [`card`] with a strong title line already drawn.
-pub fn titled_card(
+/// Section header inside a card: title on the left, optional trailing content
+/// (state pill, rescan button, clip count) pinned to the right edge.
+pub fn section_header(
     ui: &mut egui::Ui,
-    border: Color32,
-    title: RichText,
-    body: impl FnOnce(&mut egui::Ui),
+    title: impl Into<String>,
+    trailing: impl FnOnce(&mut egui::Ui),
 ) {
-    card(ui, border, move |ui| {
-        ui.label(title.small().strong());
-        ui.add_space(1.0);
-        body(ui);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title.into())
+                .small()
+                .strong()
+                .color(TEXT_MUTED),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
     });
+    ui.add_space(1.0);
 }
 
-/// Two-column key/value row with a muted, consistently-aligned key.
-pub fn kv(ui: &mut egui::Ui, key: &str, value: impl Into<egui::WidgetText>) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-        ui.add_sized(
-            egui::vec2(82.0, 16.0),
-            egui::Label::new(RichText::new(key).color(TEXT_DIM).small()),
-        );
-        ui.label(value.into().small());
-    });
+/// Rounded status pill for state badges (Idle / ● REC / Paused …).
+pub fn pill(ui: &mut egui::Ui, text: &str, fill: Color32, text_color: Color32) {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(9.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(text_color).small().strong());
+        });
 }
 
 /// Muted hint line (instructions, secondary info) at readable contrast —

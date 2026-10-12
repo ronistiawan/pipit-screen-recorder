@@ -172,6 +172,10 @@ fn esc_down_global() -> bool {
 /// builder so the exclusion lookup can never drift from the real title).
 const REC_CTRL_TITLE: &str = "Pipit — Recording";
 
+/// Title of the dedicated video-editor window. It opens when the user
+/// presses "Edit video" and closes on Save-and-Close / Close / native X.
+const EDITOR_TITLE: &str = "Pipit — Video Editor";
+
 /// Title of one of the 4 thin red marker edge windows.
 fn edge_window_title(name: &str) -> String {
     format!("Pipit edge {name}")
@@ -1509,6 +1513,478 @@ impl ScreenRecorderApp {
     pub fn close_editor(&mut self) {
         self.stop_playback();
         self.show_editor = false;
+        self.show_volume_popup = false;
+    }
+
+    /// Dedicated editor window: opened by [`Self::open_editor`], closed by
+    /// [`Self::close_editor`] (Save-and-Close / Close button / native X).
+    ///
+    /// Uses an immediate viewport so it lives as a real OS window while
+    /// `show_editor` is true and disappears automatically once it is false.
+    /// All viewports share egui's texture manager, so the thumbnails /
+    /// playback textures uploaded with the main context stay valid here.
+    fn show_editor_viewport(&mut self, ctx: &egui::Context) {
+        if !self.show_editor {
+            return;
+        }
+        // Never edit while recording (start_recording already hides the
+        // editor, this is just a safety net).
+        if self.is_recording() {
+            return;
+        }
+        let editor_id = egui::ViewportId::from_hash_of("pipit_video_editor");
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(EDITOR_TITLE)
+            .with_inner_size([1024.0, 720.0])
+            .with_min_inner_size([800.0, 600.0]);
+        if let Some(app_icon) = crate::icon::app_icon() {
+            builder = builder.with_icon(app_icon);
+        }
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(editor_id, builder, |vctx, _class| {
+            if vctx.input(|i| i.viewport().close_requested()) {
+                close_requested = true;
+                return;
+            }
+
+            let total = self.timeline.total_duration;
+            let has_timeline = total > 0.05;
+            let has_sel = self.timeline_state.has_selection();
+            let playing = self.timeline_state.is_playing;
+
+            // ---------- toolbar (top) ----------
+            egui::TopBottomPanel::top("editor_toolbar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::PANEL_EDITOR)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::CARD_AMBER))
+                        .inner_margin(theme::panel_margin()),
+                )
+                .show(vctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let save = theme::primary_btn("💾 Save and Close");
+                        if ui
+                            .add_sized([150.0, theme::BTN_H], save)
+                            .on_hover_text("Export the edited timeline to a new MP4 (volume + fades applied)")
+                            .clicked()
+                        {
+                            self.save_edited_copy();
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(has_sel, |ui| {
+                            if ui
+                                .button("❌ Delete")
+                                .on_hover_text("Delete the selected range (Del)")
+                                .on_disabled_hover_text("Select a range on the timeline first")
+                                .clicked()
+                            {
+                                self.cut_selected_range();
+                            }
+                            if ui
+                                .button("✂ Trim")
+                                .on_hover_text("Keep only the selected range, drop the rest")
+                                .on_disabled_hover_text("Select a range on the timeline first")
+                                .clicked()
+                            {
+                                self.trim_selection();
+                            }
+                        });
+                        ui.add_enabled_ui(has_timeline && !self.waveform.is_empty(), |ui| {
+                            if ui
+                                .button("🔇 Silence")
+                                .on_hover_text("Auto-remove silent parts (−44 dB threshold, 0.4 s minimum gap)")
+                                .on_disabled_hover_text("Needs a recorded clip with audio")
+                                .clicked()
+                            {
+                                self.delete_silence(0.12, 0.4);
+                            }
+                        });
+                        if ui
+                            .button(format!("🔊 Volume ×{:.2}", self.master_volume))
+                            .on_hover_text("Master volume + fades, applied when you Save")
+                            .clicked()
+                        {
+                            self.show_volume_popup = !self.show_volume_popup;
+                        }
+                        if ui
+                            .button(format!("Fade In {:.1}s", self.fade_in))
+                            .on_hover_text("Click to cycle the fade-in: off → 0.5s → 1s → 2s")
+                            .clicked()
+                        {
+                            self.fade_in = match self.fade_in {
+                                x if x < 0.1 => 0.5,
+                                x if x < 0.75 => 1.0,
+                                x if x < 1.5 => 2.0,
+                                _ => 0.0,
+                            };
+                        }
+                        if ui
+                            .button(format!("Fade Out {:.1}s", self.fade_out))
+                            .on_hover_text("Click to cycle the fade-out: off → 0.5s → 1s → 2s")
+                            .clicked()
+                        {
+                            self.fade_out = match self.fade_out {
+                                x if x < 0.1 => 0.5,
+                                x if x < 0.75 => 1.0,
+                                x if x < 1.5 => 2.0,
+                                _ => 0.0,
+                            };
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(has_timeline, |ui| {
+                            if ui
+                                .button("🔍 Zoom Selection")
+                                .on_hover_text("Fit the selected range to the visible width")
+                                .clicked()
+                            {
+                                self.timeline_state.zoom_to_selection(total);
+                            }
+                            if ui
+                                .button("↔ Show All")
+                                .on_hover_text("Zoom out so the whole timeline fits (zoom 1×)")
+                                .clicked()
+                            {
+                                self.timeline_state.show_all();
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("✕ Close")
+                                .on_hover_text(
+                                    "Close the editing window (the video and clips are kept)",
+                                )
+                                .clicked()
+                            {
+                                self.close_editor();
+                            }
+                        });
+                    });
+                });
+
+            // ---------- timeline + transport (bottom) ----------
+            egui::TopBottomPanel::bottom("editor_timeline")
+                .resizable(false)
+                .default_height(250.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::PANEL_EDITOR)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::CARD_AMBER))
+                        .inner_margin(theme::panel_margin()),
+                )
+                .show(vctx, |ui| {
+                    let playhead = self.timeline_state.playhead;
+                    let thumb_times: Vec<f64> = self.filmstrip.iter().map(|(t, _)| *t).collect();
+                    let w = ui.available_width();
+                    let timeline = &self.timeline;
+                    let tracks = crate::ui::TimelineTracks {
+                        thumb_textures: &self.thumb_textures,
+                        thumb_times: &thumb_times,
+                        waveform: &self.waveform,
+                        waveform_rate: self.waveform_rate,
+                        playhead,
+                        fade_in: self.fade_in,
+                        fade_out: self.fade_out,
+                        total,
+                    };
+                    crate::ui::draw_timeline(ui, timeline, &mut self.timeline_state, w, 150.0, None, false, &tracks);
+
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(has_timeline, |ui| {
+                            if ui
+                                .add(theme::icon_btn("⏮"))
+                                .on_hover_text("Go to start (or to the selection start)")
+                                .clicked()
+                            {
+                                self.stop_playback();
+                                let target = self
+                                    .timeline_state
+                                    .get_selection()
+                                    .filter(|(s, e)| e - s > 0.05)
+                                    .map(|(s, _)| s)
+                                    .unwrap_or(0.0);
+                                self.timeline_state.playhead = Some(target);
+                            }
+                            let range_selected = self
+                                .timeline_state
+                                .get_selection()
+                                .is_some_and(|(s, e)| e - s > 0.05);
+                            let play_hint = if range_selected {
+                                "Play only the selected range (Space)"
+                            } else {
+                                "Play / pause preview (Space)"
+                            };
+                            if ui
+                                .add(theme::icon_btn(if playing { "⏸" } else { "▶" }))
+                                .on_hover_text(play_hint)
+                                .clicked()
+                            {
+                                self.toggle_play();
+                            }
+                            if ui
+                                .add(theme::icon_btn("⏹"))
+                                .on_hover_text("Stop playback (Space)")
+                                .clicked()
+                            {
+                                self.stop_playback();
+                            }
+                        });
+                        let cur = self.timeline_state.playhead.unwrap_or(0.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                crate::ui::format_tc(cur),
+                                crate::ui::format_tc(total)
+                            ))
+                            .monospace(),
+                        )
+                        .on_hover_text("Playhead / total duration");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Total duration: {}",
+                                crate::ui::format_duration(Duration::from_secs_f64(total.max(0.0)))
+                            ))
+                            .color(theme::TEXT_DIM),
+                        );
+                        ui.label(
+                            egui::RichText::new("Space play • Del delete • +/− zoom • drag select")
+                                .color(theme::TEXT_DIM)
+                                .small(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("Open folder")
+                                .on_hover_text("Open the folder containing the last export")
+                                .clicked()
+                            {
+                                if let Some(parent) = self.output_path.parent() {
+                                    let _ = std::process::Command::new("explorer").arg(parent).spawn();
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Clips: {} • Thumbs: {}",
+                                    self.timeline.segments.len(),
+                                    self.filmstrip.len()
+                                ))
+                                .color(theme::TEXT_DIM),
+                            );
+                            let mut zoom = self.timeline_state.zoom;
+                            let zoom_label = format!("{:.0}×", zoom);
+                            ui.add(
+                                egui::Slider::new(&mut zoom, 1.0..=20.0)
+                                    .show_value(false)
+                                    .text(zoom_label),
+                            )
+                            .on_hover_text("Timeline zoom (also + / − with the editor focused)");
+                            self.timeline_state.zoom = zoom;
+                            self.timeline_state.clamp_view(total.max(0.1));
+                        });
+                    });
+                });
+
+            // ---------- preview (center) ----------
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::PANEL_CENTER)
+                        .inner_margin(egui::Margin::same(8.0)),
+                )
+                .show(vctx, |ui| {
+                egui::Frame::group(ui.style())
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.5_f32, theme::ACCENT))
+                    .rounding(egui::Rounding::same(12.0))
+                    .show(ui, |ui| {
+                        let playing_now = self.timeline_state.is_playing;
+                        let last_thumb_t = self.filmstrip.last().map(|(t, _)| *t);
+                        let parked_at_end = match (self.timeline_state.playhead, last_thumb_t) {
+                            (Some(ph), Some(last_t)) => ph >= last_t,
+                            _ => true,
+                        };
+                        let show_still = !playing_now
+                            && parked_at_end
+                            && self.preview_texture.is_some();
+                        let show_still_src: Option<(egui::TextureId, f32)> = if show_still {
+                            self.preview_texture.as_ref().map(|tex| {
+                                let (fw, fh) = self.preview_size.unwrap_or((16, 9));
+                                (tex.id(), fh as f32 / fw.max(1) as f32)
+                            })
+                        } else {
+                            None
+                        };
+
+                        let stream: Option<(egui::TextureId, f32)> = match &self.play_tex {
+                            Some((t, g, aspect, tex)) if *g == self.media_gen => {
+                                match self.timeline_state.playhead {
+                                    Some(ph) => {
+                                        let fresh = if playing_now {
+                                            *t <= ph + 0.35 && ph - *t < 1.0
+                                        } else {
+                                            (*t - ph).abs() < 0.4
+                                        };
+                                        fresh.then(|| (tex.id(), *aspect))
+                                    }
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        let scrub: Option<(egui::TextureId, f32)> = if !show_still {
+                            if let Some(ph) = self.timeline_state.playhead {
+                                if !self.thumb_textures.is_empty() {
+                                    let mut idx = 0usize;
+                                    for (i, (tt, _)) in self.filmstrip.iter().enumerate() {
+                                        if *tt <= ph {
+                                            idx = i;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    self.thumb_textures.get(idx).map(|h| h.id()).and_then(|id| {
+                                        let size = self.filmstrip.get(idx).map(|(_, img)| img.size)?;
+                                        (size[0] > 0 && size[1] > 0).then(|| (id, size[1] as f32 / size[0] as f32))
+                                    })
+                                } else { None }
+                            } else { None }
+                        } else { None };
+
+                        let scrub_still: Option<(egui::TextureId, f32)> = match &self.still_tex {
+                            Some((t, g, aspect, tex)) if *g == self.media_gen => {
+                                match self.timeline_state.playhead {
+                                    Some(ph) => {
+                                        let tol = if self.timeline_state.is_playing { 1.5 } else { 0.3 };
+                                        (*t <= ph + 0.05 && ph - *t < tol).then(|| (tex.id(), *aspect))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.heading(theme::heading("👁 Preview"));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if self.timeline_state.is_playing {
+                                    if let Some(ph) = self.timeline_state.playhead {
+                                        ui.label(egui::RichText::new(format!("▶ {}", crate::ui::format_tc(ph))).strong());
+                                    } else {
+                                        ui.label(egui::RichText::new("▶ playing").strong());
+                                    }
+                                } else if show_still {
+                                    ui.label(egui::RichText::new("last take").color(theme::TEXT_DIM));
+                                } else if scrub_still.is_some() {
+                                    ui.label(egui::RichText::new("scrub HD").color(theme::TEXT_DIM));
+                                } else if let Some(ph) = self.timeline_state.playhead {
+                                    if !self.filmstrip.is_empty() {
+                                        ui.label(egui::RichText::new(format!("scrub {}", crate::ui::format_tc(ph))).color(theme::TEXT_DIM));
+                                    } else {
+                                        ui.label(egui::RichText::new("no signal").color(theme::TEXT_DIM));
+                                    }
+                                } else {
+                                    ui.label(egui::RichText::new("no signal").color(theme::TEXT_DIM));
+                                }
+                                if self.preview_zoom > 1.01 {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.0}%", self.preview_zoom * 100.0))
+                                            .color(theme::ACCENT_DARK)
+                                            .strong(),
+                                    );
+                                }
+                                ui.add(theme::icon_btn("+"))
+                                    .on_hover_text("Zoom in (up to 800%)")
+                                    .clicked()
+                                    .then(|| self.preview_zoom = (self.preview_zoom * 1.4).min(8.0));
+                                ui.add(theme::icon_btn("⛶"))
+                                    .on_hover_text("Fit preview (100%)")
+                                    .clicked()
+                                    .then(|| self.preview_zoom = 1.0);
+                                ui.add(theme::icon_btn("−"))
+                                    .on_hover_text("Zoom out (min 100%)")
+                                    .clicked()
+                                    .then(|| self.preview_zoom = (self.preview_zoom / 1.4).max(1.0));
+                            });
+                        });
+
+                        let shown: Option<(egui::TextureId, f32)> = if playing_now {
+                            [stream, scrub_still, scrub, show_still_src]
+                        } else {
+                            [scrub_still, show_still_src, stream, scrub]
+                        }
+                        .into_iter()
+                        .flatten()
+                        .next();
+
+                        if let Some((tid, aspect)) = shown {
+                            let disp_w = show_preview_fit(ui, tid, aspect, self.preview_zoom);
+                            let src_w = self.timeline.width.div_ceil(2) * 2;
+                            self.preview_wanted_w = disp_w.ceil().max(320.0) as u32;
+                            if src_w > 0 {
+                                self.preview_wanted_w = self.preview_wanted_w.min(src_w);
+                            }
+                        } else {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 220.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 8.0, theme::PLACEHOLDER_BG);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "No video at this position",
+                                egui::FontId::proportional(14.0),
+                                theme::TEXT_DIM,
+                            );
+                        }
+                    });
+            });
+
+            // ---------- volume popup (in the editor window) ----------
+            if self.show_volume_popup {
+                let mut vol = self.master_volume;
+                let mut fi = self.fade_in;
+                let mut fo = self.fade_out;
+                let mut open = self.show_volume_popup;
+                egui::Window::new("🔊 Volume")
+                    .open(&mut open)
+                    .resizable(false)
+                    .default_width(300.0)
+                    .show(vctx, |ui| {
+                        ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("Master volume"));
+                        ui.add(egui::Slider::new(&mut fi, 0.0..=5.0).text("Fade in (s)"));
+                        ui.add(egui::Slider::new(&mut fo, 0.0..=5.0).text("Fade out (s)"));
+                        ui.separator();
+                        theme::hint(ui, format!("Timeline: {:.1}s", total));
+                        theme::hint(ui, "Applied when you press Save and Close.");
+                    });
+                self.show_volume_popup = open;
+                self.master_volume = vol;
+                self.fade_in = fi;
+                self.fade_out = fo;
+            }
+
+            // ---------- shortcuts (editor focused) ----------
+            let typing = vctx.wants_keyboard_input();
+            if !typing {
+                if vctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.show_volume_popup {
+                    self.show_volume_popup = false;
+                }
+                if vctx.input(|i| i.key_pressed(egui::Key::Delete)) && self.timeline_state.has_selection() {
+                    self.cut_selected_range();
+                }
+                if vctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                    self.toggle_play();
+                }
+                if vctx.input(|i| i.key_pressed(egui::Key::Plus) | i.key_pressed(egui::Key::Equals)) {
+                    let total = self.timeline.total_duration.max(0.1);
+                    self.timeline_state.zoom_by(1.25, total);
+                }
+                if vctx.input(|i| i.key_pressed(egui::Key::Minus)) {
+                    let total = self.timeline.total_duration.max(0.1);
+                    self.timeline_state.zoom_by(0.8, total);
+                }
+            }
+        });
+        if close_requested {
+            self.close_editor();
+        }
     }
 
     fn update_playback(&mut self) {
@@ -2003,23 +2479,19 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Thin audio level meter. Drawn directly under its channel's volume slider
+/// (the slider row above identifies the channel), spanning the remaining card
+/// width so the two meters line up column-wise.
 fn level_bar(ui: &mut egui::Ui, label: &str, level: f32, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-        // Fixed-width label so the Sys/Mic bars line up column-wise.
-        ui.add_sized(
-            egui::vec2(24.0, 12.0),
-            egui::Label::new(egui::RichText::new(label).color(theme::TEXT_DIM).small()),
-        );
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(110.0, 8.0), egui::Sense::hover());
-        resp.on_hover_text(format!("{label} level: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
-        ui.painter().rect_filled(rect, 4.0, theme::METER_TRACK);
-        let w = (rect.width() * level.clamp(0.0, 1.0)).max(if level > 0.01 { 3.0 } else { 0.0 });
-        if w > 0.0 {
-            let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()));
-            ui.painter().rect_filled(fill, 4.0, color);
-        }
-    });
+    let bar_w = ui.available_width().max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+    resp.on_hover_text(format!("{label} level: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
+    ui.painter().rect_filled(rect, 3.0, theme::METER_TRACK);
+    let w = (rect.width() * level.clamp(0.0, 1.0)).max(if level > 0.01 { 3.0 } else { 0.0 });
+    if w > 0.0 {
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()));
+        ui.painter().rect_filled(fill, 3.0, color);
+    }
 }
 
 /// Draw `tex_id` (with `height / width == aspect`) as large as possible inside
@@ -2542,9 +3014,9 @@ impl eframe::App for ScreenRecorderApp {
                         let r = ui
                             .button(label)
                             .on_hover_text(if self.show_editor {
-                                "Hide the editing timeline (Space plays, Del deletes a selection)"
+                                "Close the editor window (video and clips are kept)"
                             } else {
-                                "Show the editing timeline: cut, trim, silence, fades"
+                                "Open the editor in its own window: cut, trim, silence, fades"
                             })
                             .on_disabled_hover_text("Record a clip first — then you can edit it");
                         if r.clicked() {
@@ -2562,16 +3034,20 @@ impl eframe::App for ScreenRecorderApp {
         // ---------- left sidebar ----------
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .default_width(264.0)
+            // exact_width (not default_width): egui stores the frame's rect in
+            // PanelState each frame and reuses it, so content whose min width
+            // exceeds the panel would ratchet it wider every frame. Pinning the
+            // width_range to a point makes that impossible.
+            .exact_width(280.0)
             .frame(
                 egui::Frame::none()
                     .fill(theme::PANEL_SIDEBAR)
                     .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-                    .inner_margin(egui::Margin::symmetric(6.0, 6.0)),
+                    .inner_margin(egui::Margin::symmetric(8.0, 8.0)),
             )
             .show(ctx, |ui| {
-                ui.label(theme::heading("⚙ Setup").size(19.0).strong());
-                ui.add_space(4.0);
+                ui.label(theme::heading("Setup").size(16.0).strong());
+                ui.add_space(6.0);
 
                 // Vertical scrollbar for short windows: everything below the
                 // title scrolls, the title itself stays put.
@@ -2582,71 +3058,110 @@ impl eframe::App for ScreenRecorderApp {
                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                     )
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
-                        ui.style_mut().spacing.slider_width = 110.0;
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
                         ui.style_mut().spacing.combo_width = 150.0;
 
                         // ---- recording status ----
-                        theme::titled_card(
-                            ui,
-                            theme::CARD_BLUE,
-                            egui::RichText::new("⏺ Recording").color(theme::REC_TEXT).strong(),
-                            |ui| {
-                                theme::kv(
-                                    ui,
-                                    "State",
-                                    match self.state {
-                                        RecordingState::Idle => "Idle",
-                                        RecordingState::SelectingArea => "Selecting area…",
-                                        RecordingState::Recording => "Recording",
-                                        RecordingState::Paused => "Paused",
-                                    },
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Duration",
-                                    format_duration(self.get_recording_duration()),
-                                );
-                                theme::kv(ui, "Frames", self.current_frame_count.to_string());
-                                if let Some((w, h)) = self.capture.get_dimensions() {
-                                    theme::kv(ui, "Capturing", format!("{}×{}", w, h));
-                                } else if let Some((_, _, w, h)) = self.capture_region {
-                                    if self.capture_mode == CaptureMode::Region {
-                                        theme::kv(ui, "Region", format!("{}×{}", w, h));
-                                    }
+                        // State lives in a pill in the header; the body leads
+                        // with the duration and folds the rest into one line
+                        // instead of a five-row key/value table.
+                        theme::card(ui, |ui| {
+                            theme::section_header(ui, "Recording", |ui| {
+                                let (text, fill, color) = match self.state {
+                                    RecordingState::Idle => (
+                                        "Idle",
+                                        theme::SUBTLE_BG,
+                                        theme::TEXT_MUTED,
+                                    ),
+                                    RecordingState::SelectingArea => (
+                                        "Selecting…",
+                                        theme::ACCENT_SOFT,
+                                        theme::ACCENT_DARK,
+                                    ),
+                                    RecordingState::Recording => (
+                                        "● REC",
+                                        theme::PILL_RED,
+                                        theme::REC_TEXT,
+                                    ),
+                                    RecordingState::Paused => (
+                                        "Paused",
+                                        theme::PILL_AMBER,
+                                        theme::PAUSED,
+                                    ),
+                                };
+                                theme::pill(ui, text, fill, color);
+                            });
+                            let dur_color = match self.state {
+                                RecordingState::Idle | RecordingState::SelectingArea => {
+                                    theme::TEXT_DIM
                                 }
-                                theme::kv(ui, "Output FPS", self.target_fps.to_string());
-                            },
-                        );
+                                _ => theme::TEXT,
+                            };
+                            ui.label(
+                                egui::RichText::new(format_duration(
+                                    self.get_recording_duration(),
+                                ))
+                                .size(22.0)
+                                .strong()
+                                .color(dur_color),
+                            );
+                            let dims = match self.capture.get_dimensions() {
+                                Some((w, h)) => Some(format!("{}×{}", w, h)),
+                                None => match self.capture_region {
+                                    Some((_, _, w, h))
+                                        if self.capture_mode == CaptureMode::Region =>
+                                    {
+                                        Some(format!("{}×{}", w, h))
+                                    }
+                                    _ => None,
+                                },
+                            };
+                            let mut stats = format!(
+                                "{} frames · {} fps",
+                                self.current_frame_count, self.target_fps
+                            );
+                            if let Some(d) = dims {
+                                stats.push_str(&format!(" · {}", d));
+                            }
+                            ui.label(
+                                egui::RichText::new(stats)
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        });
 
                         ui.add_space(theme::CARD_GAP);
 
                         // ---- audio ----
-                        theme::card(ui, theme::CARD_GREEN, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("🔊 Audio")
-                                        .color(theme::CARD_TEXT_GREEN)
-                                        .small()
-                                        .strong(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .small_button("⟳")
-                                            .on_hover_text("Rescan audio devices")
-                                            .clicked()
-                                        {
-                                            self.refresh_audio();
-                                            self.status_message =
-                                                Some("Audio devices rescanned.".into());
-                                        }
-                                    },
-                                );
+                        theme::card(ui, |ui| {
+                            theme::section_header(ui, "Audio", |ui| {
+                                if ui
+                                    .small_button("⟳")
+                                    .on_hover_text("Rescan audio devices")
+                                    .clicked()
+                                {
+                                    self.refresh_audio();
+                                    self.status_message = Some("Audio devices rescanned.".into());
+                                }
                             });
                             let rec = self.is_recording();
+                            let (sys_lvl, mic_lvl) = match &self.audio_capture {
+                                Some(cap) => (cap.system_level(), cap.mic_level()),
+                                None => (0.0, 0.0),
+                            };
+                            // Each channel is a slider with its live meter
+                            // indented directly underneath, so the two are
+                            // read as one control instead of two lists.
+                            const LABEL_W: f32 = 52.0;
+                            // Width the Slider's trailing DragValue box needs
+                            // (0.00–1.50 at 2 decimals + padding). The bar
+                            // itself (`slider_width`) must leave this room:
+                            // giving the bar the full remaining width pushes
+                            // the value box past the card edge, the row
+                            // overflows, and every row below measures a wider
+                            // available_width and renders clipped.
+                            const VALUE_BOX_W: f32 = 56.0;
                             ui.add_enabled_ui(!rec, |ui| {
                                 ui.checkbox(
                                     &mut self.record_system_audio,
@@ -2658,12 +3173,18 @@ impl eframe::App for ScreenRecorderApp {
                                 );
                                 if self.record_mic {
                                     let mics = self.audio_devices.microphones.clone();
-                                    let current =
-                                        self.mic_device.clone().unwrap_or_else(|| "Default".into());
+                                    let current = self
+                                        .mic_device
+                                        .clone()
+                                        .unwrap_or_else(|| "Default".into());
                                     egui::ComboBox::from_id_salt("mic_pick")
-                                        .selected_text(theme::truncate(&current, 24))
+                                        .selected_text(theme::truncate(&current, 28))
                                         .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut self.mic_device, None, "Default");
+                                            ui.selectable_value(
+                                                &mut self.mic_device,
+                                                None,
+                                                "Default",
+                                            );
                                             for m in mics {
                                                 ui.selectable_value(
                                                     &mut self.mic_device,
@@ -2673,28 +3194,65 @@ impl eframe::App for ScreenRecorderApp {
                                             }
                                         });
                                 }
-                                ui.add(
-                                    egui::Slider::new(&mut self.system_volume, 0.0..=1.5)
-                                        .text("System vol"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.mic_volume, 0.0..=1.5)
-                                        .text("Mic vol"),
-                                );
+                                // Let the slider fill the card instead of a
+                                // fixed stub: the old rows needed ~235px in a
+                                // ~238px card, so the bar collapsed and the
+                                // handle overlapped the value box.
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        egui::vec2(LABEL_W, 18.0),
+                                        egui::Label::new(egui::RichText::new("System").small()),
+                                    );
+                                    // Subtract the inter-widget spacing AND the
+                                    // value box: available_width() is measured
+                                    // before the layout inserts spacing, and
+                                    // the Slider appends its DragValue after
+                                    // the bar. Skipping either makes the row
+                                    // (and, via PanelState, the whole panel)
+                                    // ratchet wider every frame.
+                                    let slider_w = (ui.available_width()
+                                        - ui.spacing().item_spacing.x
+                                        - VALUE_BOX_W)
+                                        .max(60.0);
+                                    ui.spacing_mut().slider_width = slider_w;
+                                    ui.add(
+                                        egui::Slider::new(&mut self.system_volume, 0.0..=1.5)
+                                            .fixed_decimals(2)
+                                            .step_by(0.05),
+                                    );
+                                });
+                                if self.record_system_audio {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                                        level_bar(ui, "System", sys_lvl, theme::METER_BLUE);
+                                    });
+                                }
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        egui::vec2(LABEL_W, 18.0),
+                                        egui::Label::new(egui::RichText::new("Mic").small()),
+                                    );
+                                    let slider_w = (ui.available_width()
+                                        - ui.spacing().item_spacing.x
+                                        - VALUE_BOX_W)
+                                        .max(60.0);
+                                    ui.spacing_mut().slider_width = slider_w;
+                                    ui.add(
+                                        egui::Slider::new(&mut self.mic_volume, 0.0..=1.5)
+                                            .fixed_decimals(2)
+                                            .step_by(0.05),
+                                    );
+                                });
+                                if self.record_mic {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+                                        level_bar(ui, "Mic", mic_lvl, theme::METER_GREEN);
+                                    });
+                                }
                             });
                             if rec {
                                 theme::hint(ui, "Audio toggles lock while recording.");
-                            }
-                            // Live meters (also animate before recording when idle? show last levels or 0).
-                            let (sys_lvl, mic_lvl) = match &self.audio_capture {
-                                Some(cap) => (cap.system_level(), cap.mic_level()),
-                                None => (0.0, 0.0),
-                            };
-                            if self.record_system_audio {
-                                level_bar(ui, "Sys", sys_lvl, theme::METER_BLUE);
-                            }
-                            if self.record_mic {
-                                level_bar(ui, "Mic", mic_lvl, theme::METER_GREEN);
                             }
                             if !self.record_system_audio && !self.record_mic {
                                 theme::hint(ui, "Audio off — video only.");
@@ -2722,118 +3280,131 @@ impl eframe::App for ScreenRecorderApp {
                         ui.add_space(theme::CARD_GAP);
 
                         // ---- selection ----
-                        theme::titled_card(
-                            ui,
-                            theme::CARD_AMBER,
-                            egui::RichText::new("✂ Selection").color(theme::PAUSED).strong(),
-                            |ui| {
-                                let rec = self.is_recording();
-                                if let Some((s, e)) = self.timeline_state.get_selection() {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{:.2}s → {:.2}s ({:.2}s)",
-                                            s,
-                                            e,
-                                            e - s
-                                        ))
-                                        .small(),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled_ui(!rec, |ui| {
-                                            if ui
-                                                .small_button("Delete (Del)")
-                                                .on_hover_text(
-                                                    "Remove the selected range from the timeline",
-                                                )
-                                                .on_disabled_hover_text("Stop recording first")
-                                                .clicked()
-                                            {
-                                                self.cut_selected_range();
-                                            }
-                                            if ui
-                                                .small_button("Trim")
-                                                .on_hover_text(
-                                                    "Keep only the selected range, drop the rest",
-                                                )
-                                                .on_disabled_hover_text("Stop recording first")
-                                                .clicked()
-                                            {
-                                                self.trim_selection();
-                                            }
-                                        });
+                        // Clip count/total moved into the header so the body
+                        // only carries the active selection and its actions.
+                        theme::card(ui, |ui| {
+                            theme::section_header(ui, "Selection", |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} clips · {:.1}s",
+                                        self.timeline.segments.len(),
+                                        self.live_duration_secs()
+                                    ))
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                                );
+                            });
+                            let rec = self.is_recording();
+                            if let Some((s, e)) = self.timeline_state.get_selection() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.2}s → {:.2}s ({:.2}s)",
+                                        s,
+                                        e,
+                                        e - s
+                                    ))
+                                    .small(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled_ui(!rec, |ui| {
                                         if ui
-                                            .small_button("Clear")
-                                            .on_hover_text("Deselect the current range")
+                                            .small_button("Delete")
+                                            .on_hover_text(
+                                                "Remove the selected range from the timeline (Del)",
+                                            )
+                                            .on_disabled_hover_text("Stop recording first")
                                             .clicked()
                                         {
-                                            self.timeline_state.clear_selection();
+                                            self.cut_selected_range();
+                                        }
+                                        if ui
+                                            .small_button("Trim")
+                                            .on_hover_text(
+                                                "Keep only the selected range, drop the rest",
+                                            )
+                                            .on_disabled_hover_text("Stop recording first")
+                                            .clicked()
+                                        {
+                                            self.trim_selection();
                                         }
                                     });
-                                } else {
-                                    theme::hint(ui, "Drag on the timeline to select.");
-                                }
+                                    if ui
+                                        .small_button("Clear")
+                                        .on_hover_text("Deselect the current range")
+                                        .clicked()
+                                    {
+                                        self.timeline_state.clear_selection();
+                                    }
+                                });
                                 if let Some(ph) = self.timeline_state.playhead {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "Playhead: {}",
                                             crate::ui::format_tc(ph)
                                         ))
-                                        .small(),
+                                        .small()
+                                        .color(theme::TEXT_MUTED),
                                     );
                                 }
-                                ui.separator();
+                            } else {
+                                theme::hint(ui, "Drag on the timeline to select a range.");
+                            }
+                            if self.fade_in > 0.05 || self.fade_out > 0.05 {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "Clips: {}  •  Total: {:.1}s",
-                                        self.timeline.segments.len(),
-                                        self.live_duration_secs()
+                                        "Fades: in {:.1}s / out {:.1}s",
+                                        self.fade_in, self.fade_out
                                     ))
-                                    .small(),
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
                                 );
-                                if self.fade_in > 0.05 || self.fade_out > 0.05 {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Fades: in {:.1}s / out {:.1}s",
-                                            self.fade_in, self.fade_out
-                                        ))
-                                        .small(),
-                                    );
+                            }
+                            if self.show_editor {
+                                theme::hint(ui, "Editor is open in its own window.");
+                            } else if self.has_editable_video() && !self.is_recording() {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(ui.available_width(), 24.0),
+                                        egui::Button::new("Edit video"),
+                                    )
+                                    .on_hover_text(
+                                        "Open the editor in its own window (cut, trim, fades)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_editor();
                                 }
-                                if self.show_editor {
-                                    theme::hint(ui, "Full editor tools are docked below the preview.");
-                                } else if self.has_editable_video() && !self.is_recording() {
-                                    if ui
-                                        .small_button("✂ Edit video")
-                                        .on_hover_text("Show the editing timeline (cut, trim, fades)")
-                                        .clicked()
-                                    {
-                                        self.open_editor();
-                                    }
-                                } else {
-                                    theme::hint(ui, "Record a clip, then press Edit video to edit.");
-                                }
-                            },
-                        );
+                            } else {
+                                theme::hint(ui, "Record a clip, then press Edit video to edit.");
+                            }
+                        });
 
                         ui.add_space(theme::CARD_GAP);
-                        theme::card(ui, theme::CARD_VIOLET, |ui| {
-                            ui.label(
-                                egui::RichText::new("💾 Save folder")
-                                    .color(theme::CARD_TEXT_VIOLET)
-                                    .small()
-                                    .strong(),
-                            );
+                        // ---- save folder ----
+                        // The "last file" line moved inside the card so the
+                        // sidebar ends on one object instead of a card plus a
+                        // dangling caption.
+                        theme::card(ui, |ui| {
+                            theme::section_header(ui, "Save folder", |_| {});
                             let dir = self.output_dir.display().to_string();
-                            ui.label(
-                                egui::RichText::new(theme::truncate(&dir, 38))
-                                    .color(theme::TEXT_MUTED)
-                                    .small(),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&dir).color(theme::TEXT_MUTED).small(),
+                                )
+                                .truncate(),
                             )
                             .on_hover_text(&dir);
                             ui.horizontal(|ui| {
+                                let half = ((ui.available_width()
+                                    - ui.spacing().item_spacing.x)
+                                    / 2.0)
+                                    .max(60.0);
                                 ui.add_enabled_ui(!self.is_recording(), |ui| {
                                     if ui
-                                        .small_button("Browse…")
+                                        .add_sized(
+                                            egui::vec2(half, 24.0),
+                                            egui::Button::new("Browse…"),
+                                        )
                                         .on_hover_text("Choose where new recordings are saved")
                                         .clicked()
                                     {
@@ -2845,7 +3416,10 @@ impl eframe::App for ScreenRecorderApp {
                                     }
                                 });
                                 if ui
-                                    .small_button("Open")
+                                    .add_sized(
+                                        egui::vec2(half, 24.0),
+                                        egui::Button::new("Open"),
+                                    )
                                     .on_hover_text("Open the save folder in Explorer")
                                     .clicked()
                                 {
@@ -2859,15 +3433,15 @@ impl eframe::App for ScreenRecorderApp {
                             } else {
                                 theme::hint(ui, "Next: recording_<date>_<time>.mp4");
                             }
+                            let last = format!("Last: {}", self.output_path.display());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&last).color(theme::TEXT_DIM).small(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(last);
                         });
-                        ui.add_space(2.0);
-                        let last = format!("Last file: {}", self.output_path.display());
-                        ui.label(
-                            egui::RichText::new(theme::truncate(&last, 42))
-                                .color(theme::TEXT_DIM)
-                                .small(),
-                        )
-                        .on_hover_text(last);
                     });
             });
 
@@ -2908,260 +3482,50 @@ impl eframe::App for ScreenRecorderApp {
             });
         });
 
-        // ---------- editor dock: only when the user chooses Edit video ----------
-        // Shown after the status bar so it stacks above it (each later bottom
-        // panel reserves space on top of the previous one).
-        if self.show_editor {
-            let is_rec = matches!(self.state, RecordingState::Recording | RecordingState::Paused);
-            let live_opt = if is_rec {
-                Some(self.get_recording_duration().as_secs_f64())
-            } else {
-                None
-            };
-            let total = self.timeline.total_duration.max(live_opt.unwrap_or(0.0));
-            let has_timeline = total > 0.05;
-            let has_sel = self.timeline_state.has_selection();
-            let playing = self.timeline_state.is_playing;
-            egui::TopBottomPanel::bottom("editor_dock")
-                .resizable(false)
-                .default_height(296.0)
+        // ---------- dedicated editor window ----------
+        // Opens when the user presses Edit video, closes on Save-and-Close /
+        // Close / native X. Rendered as its own OS window; the main window
+        // only shows a placeholder while it is open (see center panel).
+        self.show_editor_viewport(ctx);
+
+        // ---------- center: recorder preview (editor lives in its own window) ----------
+        let has_recorded_video = self.has_editable_video();
+        if self.show_editor && !self.is_recording() {
+            // Editor is open in its dedicated window — keep the main window
+            // as a lightweight companion instead of duplicating the preview.
+            egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(theme::PANEL_EDITOR)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::CARD_AMBER))
-                        .inner_margin(theme::panel_margin()),
+                        .fill(theme::PANEL_CENTER)
+                        .inner_margin(egui::Margin::same(8.0)),
                 )
                 .show(ctx, |ui| {
-                    // Toolbar (ribbon row).
-                    ui.horizontal_wrapped(|ui| {
-                        let save = theme::primary_btn("💾 Save and Close");
-                        if ui
-                            .add_sized([150.0, theme::BTN_H], save)
-                            .on_hover_text("Export the edited timeline to a new MP4 (volume + fades applied)")
-                            .clicked()
-                        {
-                            self.save_edited_copy();
-                        }
-                        ui.separator();
-                        ui.add_enabled_ui(has_sel && !is_rec, |ui| {
-                            if ui
-                                .button("❌ Delete")
-                                .on_hover_text("Delete the selected range (Del)")
-                                .on_disabled_hover_text(if is_rec {
-                                    "Stop recording first"
-                                } else {
-                                    "Select a range on the timeline first"
-                                })
-                                .clicked()
-                            {
-                                self.cut_selected_range();
-                            }
-                            if ui
-                                .button("✂ Trim")
-                                .on_hover_text("Keep only the selected range, drop the rest")
-                                .on_disabled_hover_text(if is_rec {
-                                    "Stop recording first"
-                                } else {
-                                    "Select a range on the timeline first"
-                                })
-                                .clicked()
-                            {
-                                self.trim_selection();
-                            }
-                        });
-                        ui.add_enabled_ui(!is_rec && has_timeline && !self.waveform.is_empty(), |ui| {
-                            if ui
-                                .button("🔇 Silence")
-                                .on_hover_text("Auto-remove silent parts (−44 dB threshold, 0.4 s minimum gap)")
-                                .on_disabled_hover_text(if is_rec {
-                                    "Stop recording first"
-                                } else {
-                                    "Needs a recorded clip with audio"
-                                })
-                                .clicked()
-                            {
-                                self.delete_silence(0.12, 0.4);
-                            }
-                        });
-                        if ui
-                            .button(format!("🔊 Volume ×{:.2}", self.master_volume))
-                            .on_hover_text("Master volume + fades, applied when you Save")
-                            .clicked()
-                        {
-                            self.show_volume_popup = !self.show_volume_popup;
-                        }
-                        if ui
-                            .button(format!("Fade In {:.1}s", self.fade_in))
-                            .on_hover_text("Click to cycle the fade-in: off → 0.5s → 1s → 2s")
-                            .clicked()
-                        {
-                            self.fade_in = match self.fade_in {
-                                x if x < 0.1 => 0.5,
-                                x if x < 0.75 => 1.0,
-                                x if x < 1.5 => 2.0,
-                                _ => 0.0,
-                            };
-                        }
-                        if ui
-                            .button(format!("Fade Out {:.1}s", self.fade_out))
-                            .on_hover_text("Click to cycle the fade-out: off → 0.5s → 1s → 2s")
-                            .clicked()
-                        {
-                            self.fade_out = match self.fade_out {
-                                x if x < 0.1 => 0.5,
-                                x if x < 0.75 => 1.0,
-                                x if x < 1.5 => 2.0,
-                                _ => 0.0,
-                            };
-                        }
-                        ui.separator();
-                        ui.add_enabled_ui(has_timeline, |ui| {
-                            if ui
-                                .button("🔍 Zoom Selection")
-                                .on_hover_text("Fit the selected range to the visible width")
-                                .clicked()
-                            {
-                                self.timeline_state.zoom_to_selection(total);
-                            }
-                            if ui
-                                .button("↔ Show All")
-                                .on_hover_text("Zoom out so the whole timeline fits (zoom 1×)")
-                                .clicked()
-                            {
-                                self.timeline_state.show_all();
-                            }
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button("✕ Close")
-                                .on_hover_text(
-                                    "Hide the editing timeline (the video and clips are kept)",
-                                )
-                                .clicked()
-                            {
-                                self.close_editor();
-                            }
-                        });
-                    });
-                    ui.separator();
-
-                    // Tracks.
-                    let playhead = self.timeline_state.playhead;
-                    let thumb_times: Vec<f64> = self.filmstrip.iter().map(|(t, _)| *t).collect();
-                    let w = ui.available_width();
-                    let timeline = &self.timeline;
-                    let tracks = crate::ui::TimelineTracks {
-                        thumb_textures: &self.thumb_textures,
-                        thumb_times: &thumb_times,
-                        waveform: &self.waveform,
-                        waveform_rate: self.waveform_rate,
-                        playhead,
-                        fade_in: self.fade_in,
-                        fade_out: self.fade_out,
-                        total,
-                    };
-                    crate::ui::draw_timeline(ui, timeline, &mut self.timeline_state, w, 168.0, live_opt, is_rec, &tracks);
-
-                    // Transport.
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(has_timeline && !is_rec, |ui| {
-                            if ui
-                                .add(theme::icon_btn("⏮"))
-                                .on_hover_text("Go to start (or to the selection start)")
-                                .clicked()
-                            {
-                                self.stop_playback();
-                                // With a range selected, "start" is its head.
-                                let target = self
-                                    .timeline_state
-                                    .get_selection()
-                                    .filter(|(s, e)| e - s > 0.05)
-                                    .map(|(s, _)| s)
-                                    .unwrap_or(0.0);
-                                self.timeline_state.playhead = Some(target);
-                            }
-                            let range_selected = self
-                                .timeline_state
-                                .get_selection()
-                                .is_some_and(|(s, e)| e - s > 0.05);
-                            let play_hint = if range_selected {
-                                "Play only the selected range (Space)"
-                            } else {
-                                "Play / pause preview (Space)"
-                            };
-                            if ui
-                                .add(theme::icon_btn(if playing { "⏸" } else { "▶" }))
-                                .on_hover_text(play_hint)
-                                .clicked()
-                            {
-                                self.toggle_play();
-                            }
-                            if ui
-                                .add(theme::icon_btn("⏹"))
-                                .on_hover_text("Stop playback (Space)")
-                                .clicked()
-                            {
-                                self.stop_playback();
-                            }
-                        });
-                        let cur = self.timeline_state.playhead.unwrap_or(0.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {}",
-                                crate::ui::format_tc(cur),
-                                crate::ui::format_tc(total)
-                            ))
-                            .monospace(),
-                        )
-                        .on_hover_text("Playhead / total duration");
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Total duration: {}",
-                                format_duration(Duration::from_secs_f64(total.max(0.0)))
-                            ))
-                            .color(theme::TEXT_DIM),
-                        );
-                        ui.label(
-                            egui::RichText::new("Space play • Del delete • +/− zoom • drag select")
-                                .color(theme::TEXT_DIM)
-                                .small(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button("Open folder")
-                                .on_hover_text("Open the folder containing the last export")
-                                .clicked()
-                            {
-                                if let Some(parent) = self.output_path.parent() {
-                                    let _ = std::process::Command::new("explorer").arg(parent).spawn();
-                                }
-                            }
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Clips: {} • Thumbs: {}",
-                                    self.timeline.segments.len(),
-                                    self.filmstrip.len()
-                                ))
-                                .color(theme::TEXT_DIM),
-                            );
-                            let mut zoom = self.timeline_state.zoom;
-                            let zoom_label = format!("{:.0}×", zoom);
-                            ui.add(
-                                egui::Slider::new(&mut zoom, 1.0..=20.0)
-                                    .show_value(false)
-                                    .text(zoom_label),
-                            )
-                            .on_hover_text("Timeline zoom (also + / − with the editor focused)");
-                            self.timeline_state.zoom = zoom;
-                            self.timeline_state.clamp_view(total.max(0.1));
-                        });
-                    });
+                ui.vertical_centered(|ui| {
+                    ui.add_space(48.0);
+                    ui.heading(theme::heading("✂ Editing in a separate window"));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} clip{} • {:.1}s",
+                            self.timeline.segments.len(),
+                            if self.timeline.segments.len() == 1 { "" } else { "s" },
+                            self.timeline.total_duration,
+                        ))
+                        .color(theme::TEXT_MUTED),
+                    );
+                    theme::hint(ui, "Use the \"Pipit — Video Editor\" window to cut, trim and preview.");
+                    theme::hint(ui, "💾 Save and Close exports and closes that window.");
+                    ui.add_space(16.0);
+                    if ui
+                        .add(theme::primary_btn("✕ Close editor"))
+                        .on_hover_text("Close the editing window (the video and clips are kept)")
+                        .clicked()
+                    {
+                        self.close_editor();
+                    }
                 });
-        }
-
-        // ---------- center: preview only (timeline is docked below) ----------
-        let has_recorded_video = self.has_editable_video();
-        if self.is_recording() || has_recorded_video {
+            });
+        } else if self.is_recording() || has_recorded_video {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
@@ -3349,13 +3713,13 @@ impl eframe::App for ScreenRecorderApp {
                     }
                 });
 
-                // Entry point to the (hidden-by-default) editing timeline.
+                // Entry point to the dedicated editor window.
                 if !self.show_editor && !self.is_recording() && has_recorded_video {
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
                         if ui
                             .add(theme::primary_btn("✂ Edit video"))
-                            .on_hover_text("Show the editing timeline (cut, trim, fades)")
+                            .on_hover_text("Open the editor in its own window (cut, trim, fades)")
                             .clicked()
                         {
                             self.open_editor();
@@ -3399,32 +3763,15 @@ impl eframe::App for ScreenRecorderApp {
             });
         }
 
-        // Shortcuts apply to the editing timeline, so only when visible.
-        // `wants_keyboard_input` keeps Space/+/- from firing while a slider,
-        // drag value or text field has keyboard focus.
+        // Editor shortcuts (Space/Del/+/-) live in the dedicated editor
+        // window now (checked against its own context there). The main
+        // window only dismisses Settings with Escape.
         let typing = ctx.wants_keyboard_input();
-        if (self.show_settings || self.show_volume_popup)
+        if self.show_settings
             && !typing
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.show_settings = false;
-            self.show_volume_popup = false;
-        }
-        if self.show_editor && !typing {
-            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) && self.timeline_state.has_selection() {
-                self.cut_selected_range();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                self.toggle_play();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Plus) | i.key_pressed(egui::Key::Equals)) {
-                let total = self.timeline.total_duration.max(0.1);
-                self.timeline_state.zoom_by(1.25, total);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
-                let total = self.timeline.total_duration.max(0.1);
-                self.timeline_state.zoom_by(0.8, total);
-            }
         }
 
         if self.show_settings {
@@ -3497,29 +3844,8 @@ impl eframe::App for ScreenRecorderApp {
             }
         }
 
-        if self.show_volume_popup {
-            let mut vol = self.master_volume;
-            let mut fi = self.fade_in;
-            let mut fo = self.fade_out;
-            let total = self.timeline.total_duration;
-            let mut open = self.show_volume_popup;
-            egui::Window::new("🔊 Volume")
-                .open(&mut open)
-                .resizable(false)
-                .default_width(300.0)
-                .show(ctx, |ui| {
-                    ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("Master volume"));
-                    ui.add(egui::Slider::new(&mut fi, 0.0..=5.0).text("Fade in (s)"));
-                    ui.add(egui::Slider::new(&mut fo, 0.0..=5.0).text("Fade out (s)"));
-                    ui.separator();
-                    theme::hint(ui, format!("Timeline: {:.1}s", total));
-                    theme::hint(ui, "Applied when you press Save and Close.");
-                });
-            self.show_volume_popup = open;
-            self.master_volume = vol;
-            self.fade_in = fi;
-            self.fade_out = fo;
-        }
+        // Volume popup lives in the dedicated editor window now
+        // (see show_editor_viewport) — the button that opens it is there.
 
         // Repaint budget: hold 60 fps only while something is actually
         // animating (live capture, playback, a scrub decode in flight, the
