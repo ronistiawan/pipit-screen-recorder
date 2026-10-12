@@ -108,6 +108,8 @@ pub struct ScreenRecorderApp {
     last_frame: Option<FrameData>,
     preview_texture: Option<egui::TextureHandle>,
     preview_size: Option<(u32, u32)>,
+    /// Pixel dims of the uploaded preview texture (for handle reuse).
+    preview_tex_size: Option<(usize, usize)>,
     last_preview_update: Option<Instant>,
     // ---- scrub stills (sharp full-res frame decoded on demand) ----
     /// (timeline_t, media generation, aspect, texture)
@@ -353,6 +355,7 @@ impl ScreenRecorderApp {
             last_frame: None,
             preview_texture: None,
             preview_size: None,
+            preview_tex_size: None,
             last_preview_update: None,
             still_tex: None,
             still_rx: None,
@@ -492,6 +495,7 @@ impl ScreenRecorderApp {
         self.last_frame = None;
         self.preview_texture = None;
         self.preview_size = None;
+        self.preview_tex_size = None;
         self.filmstrip.clear();
         self.thumb_textures.clear();
         self.last_thumb_time = 0.0;
@@ -1769,13 +1773,16 @@ impl ScreenRecorderApp {
                                 .color(theme::TEXT_DIM),
                             );
                             let mut zoom = self.timeline_state.zoom;
-                            let zoom_label = format!("{:.0}×", zoom);
-                            ui.add(
-                                egui::Slider::new(&mut zoom, 1.0..=20.0)
-                                    .show_value(false)
-                                    .text(zoom_label),
-                            )
-                            .on_hover_text("Timeline zoom (also + / − with the editor focused)");
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}×", zoom))
+                                    .small()
+                                    .strong()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            theme::modern_slider(ui, &mut zoom, 1.0, 20.0, theme::ACCENT)
+                                .on_hover_text(
+                                    "Timeline zoom (also + / − with the editor focused)",
+                                );
                             self.timeline_state.zoom = zoom;
                             self.timeline_state.clamp_view(total.max(0.1));
                         });
@@ -1941,15 +1948,46 @@ impl ScreenRecorderApp {
                 let mut vol = self.master_volume;
                 let mut fi = self.fade_in;
                 let mut fo = self.fade_out;
+                let mut fi_f = fi as f32;
+                let mut fo_f = fo as f32;
                 let mut open = self.show_volume_popup;
                 egui::Window::new("🔊 Volume")
                     .open(&mut open)
                     .resizable(false)
                     .default_width(300.0)
                     .show(vctx, |ui| {
-                        ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("Master volume"));
-                        ui.add(egui::Slider::new(&mut fi, 0.0..=5.0).text("Fade in (s)"));
-                        ui.add(egui::Slider::new(&mut fo, 0.0..=5.0).text("Fade out (s)"));
+                        labeled_slider(
+                            ui,
+                            "Master volume",
+                            format!("×{vol:.2}"),
+                            &mut vol,
+                            0.0,
+                            2.0,
+                            theme::ACCENT,
+                            "Overall loudness applied when you Save",
+                        );
+                        labeled_slider(
+                            ui,
+                            "Fade in",
+                            format!("{fi:.1}s"),
+                            &mut fi_f,
+                            0.0,
+                            5.0,
+                            theme::ACCENT,
+                            "Volume ramp at the start of the export",
+                        );
+                        labeled_slider(
+                            ui,
+                            "Fade out",
+                            format!("{fo:.1}s"),
+                            &mut fo_f,
+                            0.0,
+                            5.0,
+                            theme::ACCENT,
+                            "Volume ramp at the end of the export",
+                        );
+                        fi = fi_f as f64;
+                        fo = fo_f as f64;
                         ui.separator();
                         theme::hint(ui, format!("Timeline: {:.1}s", total));
                         theme::hint(ui, "Applied when you press Save and Close.");
@@ -2088,12 +2126,35 @@ impl ScreenRecorderApp {
             return;
         }
         let t = self.get_recording_duration().as_secs_f64();
-        if t - self.last_thumb_time >= 0.5 {
-            if let Some(f) = &self.last_frame {
-                if let Some(img) = Self::downscale_to_thumb(&f.buffer, f.width, f.height) {
-                    self.filmstrip.push((t, img));
+        // Stamp thumbs with the timeline (frame-count) clock, not the wall
+        // clock: the timeline's segments are measured in encoded frames, so
+        // wall-stamped thumbs drift right whenever frames arrive late (slow
+        // capture startup) or get duplicated to catch up — leaving the
+        // strip's left half empty.
+        let ft = self.current_frame_count as f64 / self.target_fps.max(1) as f64;
+        if let Some(f) = &self.last_frame {
+            if self.filmstrip.is_empty() {
+                // Anchor the strip at the left edge: backfill the startup
+                // gap with the first frame. The encoder duplicated that same
+                // frame across the gap, so these thumbs match the video.
+                if let Some(img0) = Self::downscale_to_thumb(&f.buffer, f.width, f.height) {
+                    let mut bt = 0.0;
+                    while bt + 0.5 <= ft && self.filmstrip.len() < 120 {
+                        self.filmstrip.push((bt, img0.clone()));
+                        bt += 0.5;
+                    }
+                    // Always stamp the newest frame too, so the strip reaches
+                    // the playhead even mid-gap.
+                    let anchor = ft.max(bt);
+                    self.filmstrip.push((anchor, img0));
                     // Textures are (re)built lazily in ensure_thumb_textures.
-                    self.last_thumb_time = t;
+                    self.last_thumb_time = anchor;
+                }
+            } else if ft - self.last_thumb_time >= 0.5 {
+                if let Some(img) = Self::downscale_to_thumb(&f.buffer, f.width, f.height) {
+                    self.filmstrip.push((ft, img));
+                    // Textures are (re)built lazily in ensure_thumb_textures.
+                    self.last_thumb_time = ft;
                 }
             }
         }
@@ -2347,17 +2408,41 @@ impl ScreenRecorderApp {
             .pick_folder()
     }
 
+    /// Blocking ffmpeg.exe picker; starts in the current binary's folder.
+    fn pick_ffmpeg_dialog(current: &Path) -> Option<PathBuf> {
+        let mut dlg = rfd::FileDialog::new().set_file_name("ffmpeg.exe");
+        #[cfg(target_os = "windows")]
+        {
+            dlg = dlg.add_filter("ffmpeg (ffmpeg.exe)", &["exe"]);
+        }
+        if current.components().count() > 1 {
+            if let Some(parent) = current.parent() {
+                if !parent.as_os_str().is_empty() && parent.exists() {
+                    dlg = dlg.set_directory(parent);
+                }
+            }
+        }
+        dlg.pick_file()
+    }
+
     fn update_preview(&mut self, ctx: &egui::Context) {
+        // A preview is for the eye, not the encoder: ~30Hz is plenty and
+        // halves the cost of the area-average downscale below.
+        if self
+            .last_preview_update
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(33))
+        {
+            return;
+        }
         if let Some(frame) = &self.last_frame {
             let (w, h) = (frame.width as usize, frame.height as usize);
             if w == 0 || h == 0 || frame.buffer.len() < w * h * 4 {
                 return;
             }
-            // Downscale before the CPU RGBA->Color32 convert + GPU upload.
-            // A 1920x1080 frame is ~8MB per upload; capping the preview at
-            // 640px wide cuts CPU + bandwidth ~9x vs full-res with no
-            // visible loss in the small preview panel.
-            const PREVIEW_MAX_W: usize = 640;
+            // Downscale before the CPU convert + GPU upload: a 1920×1080
+            // frame is ~8MB per upload. 960px wide is ~1:1 with the on-screen
+            // panel, so the preview stays crisp without full-res cost.
+            const PREVIEW_MAX_W: usize = 960;
             let scale = if w > PREVIEW_MAX_W {
                 PREVIEW_MAX_W as f32 / w as f32
             } else {
@@ -2368,19 +2453,39 @@ impl ScreenRecorderApp {
             } else {
                 let tw = ((w as f32 * scale).round() as usize).max(1);
                 let th = ((h as f32 * scale).round() as usize).max(1);
+                // Box (area-average) filter: every source pixel contributes
+                // to exactly one dest pixel, so 1px text strokes average down
+                // instead of flickering in and out like point sampling does.
+                let x_ratio = w as f32 / tw as f32;
+                let y_ratio = h as f32 / th as f32;
                 let mut pixels = Vec::with_capacity(tw * th);
                 for y in 0..th {
-                    let sy = (y * h / th).min(h - 1);
-                    let row_off = sy * w * 4;
+                    let sy0 = (y as f32 * y_ratio) as usize;
+                    let sy1 = (((y + 1) as f32 * y_ratio).ceil() as usize)
+                        .min(h)
+                        .max(sy0 + 1);
                     for x in 0..tw {
-                        let sx = (x * w / tw).min(w - 1);
-                        let o = row_off + sx * 4;
-                        // from_rgb skips the alpha-unmultiply math: cheaper
-                        // per pixel and identical when alpha is opaque.
+                        let sx0 = (x as f32 * x_ratio) as usize;
+                        let sx1 = (((x + 1) as f32 * x_ratio).ceil() as usize)
+                            .min(w)
+                            .max(sx0 + 1);
+                        let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                        for sy in sy0..sy1 {
+                            let row_off = sy * w * 4;
+                            for sx in sx0..sx1 {
+                                let o = row_off + sx * 4;
+                                // from_rgb skips the alpha-unmultiply math:
+                                // cheaper and identical when alpha is opaque.
+                                r += frame.buffer[o] as u32;
+                                g += frame.buffer[o + 1] as u32;
+                                b += frame.buffer[o + 2] as u32;
+                                n += 1;
+                            }
+                        }
                         pixels.push(Color32::from_rgb(
-                            frame.buffer[o],
-                            frame.buffer[o + 1],
-                            frame.buffer[o + 2],
+                            (r / n) as u8,
+                            (g / n) as u8,
+                            (b / n) as u8,
                         ));
                     }
                 }
@@ -2389,14 +2494,22 @@ impl ScreenRecorderApp {
                     pixels,
                 }
             };
-            // NEAREST skips GPU bilinear filtering on the upload path;
-            // at 640px in a small panel the quality loss is negligible.
-            let tex = ctx.load_texture(
-                "live-preview",
-                image,
-                egui::TextureOptions::NEAREST,
-            );
-            self.preview_texture = Some(tex);
+            // LINEAR: the panel rarely matches the texture 1:1, and bilinear
+            // magnification hides the resample grid that NEAREST showed as
+            // chunky "pixelated" text.
+            let options = egui::TextureOptions::LINEAR;
+            let dims = (image.width(), image.height());
+            match &mut self.preview_texture {
+                // Same dims: re-upload into the live handle instead of
+                // allocating + freeing a GPU texture every frame.
+                Some(tex) if self.preview_tex_size == Some(dims) => {
+                    tex.set(image, options);
+                }
+                slot => {
+                    *slot = Some(ctx.load_texture("live-preview", image, options));
+                    self.preview_tex_size = Some(dims);
+                }
+            }
             self.preview_size = Some((frame.width, frame.height));
             self.last_preview_update = Some(Instant::now());
         }
@@ -2479,67 +2592,51 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Modern volume slider: a slim rounded track with an accent fill and a
-/// floating white thumb. Click or drag anywhere on the row to set the value.
-///
-/// Unlike `egui::Slider` there is no trailing DragValue box eating horizontal
-/// space — the value lives in the channel header as a `%` badge — so the row
-/// can safely span the full card width without overflowing it.
+/// Modern volume slider: the shared [`theme::modern_slider`] with a
+/// volume-flavoured hover label. The value lives in the channel header as a
+/// `%` badge, so the row can safely span the full card width.
 fn volume_slider(
     ui: &mut egui::Ui,
     value: &mut f32,
     max: f32,
     accent: Color32,
 ) -> egui::Response {
-    let h = 24.0_f32;
-    let w = ui.available_width().max(60.0);
-    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
-    if resp.dragged() || resp.clicked() {
-        if let Some(p) = resp.interact_pointer_pos() {
-            // Inset by the thumb radius so the thumb centre maps exactly.
-            let pad = 9.0_f32;
-            let x0 = rect.left() + pad;
-            let x1 = rect.right() - pad;
-            let t = ((p.x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
-            *value = (t * max).clamp(0.0, max);
-            resp.mark_changed();
-        }
-    }
-    let enabled = ui.is_enabled();
     let t = (*value / max).clamp(0.0, 1.0);
-    let painter = ui.painter_at(rect);
-    let mid = rect.center().y;
-    let track_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), mid - 3.5),
-        egui::pos2(rect.right(), mid + 3.5),
-    );
-    painter.rect_filled(track_rect, 3.5, theme::METER_TRACK);
-    let pad = 9.0_f32;
-    let x0 = rect.left() + pad;
-    let cx = x0 + t * ((rect.right() - pad) - x0).max(0.0);
-    if cx > rect.left() + 1.0 {
-        let fill_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), mid - 3.5),
-            egui::pos2(cx.max(rect.left() + 7.0), mid + 3.5),
+    theme::modern_slider(ui, value, 0.0, max, accent)
+        .on_hover_text(format!("Volume {:.0}% — drag to adjust", t * 100.0))
+}
+
+/// Label row (name left, live value right) + full-width modern slider.
+/// Used everywhere a stock `egui::Slider` used to sit (zoom, Settings,
+/// volume popup) so no default slider remains in the app.
+#[allow(clippy::too_many_arguments)]
+fn labeled_slider(
+    ui: &mut egui::Ui,
+    name: &str,
+    value_text: String,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    accent: Color32,
+    hover: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(name)
+                .small()
+                .strong()
+                .color(theme::TEXT),
         );
-        painter.rect_filled(
-            fill_rect,
-            3.5,
-            if enabled { accent } else { theme::BORDER_STRONG },
-        );
-    }
-    // Thumb: soft shadow + white knob + accent ring, grows on hover/drag.
-    let hovered = resp.hovered() || resp.dragged();
-    let r = if hovered { 8.5 } else { 7.5 };
-    let center = egui::pos2(cx.clamp(rect.left() + pad, rect.right() - pad), mid);
-    painter.circle_filled(center, r + 1.5, Color32::from_black_alpha(28));
-    painter.circle_filled(center, r, Color32::WHITE);
-    painter.circle_stroke(
-        center,
-        r,
-        egui::Stroke::new(2.0_f32, if enabled { accent } else { theme::BORDER_STRONG }),
-    );
-    resp.on_hover_text(format!("Volume {:.0}% — drag to adjust", t * 100.0))
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(value_text)
+                    .small()
+                    .strong()
+                    .color(accent),
+            );
+        });
+    });
+    theme::modern_slider(ui, value, min, max, accent).on_hover_text(hover);
 }
 
 /// Slim live-level meter that sits under its channel's slider.
@@ -3879,9 +3976,16 @@ impl eframe::App for ScreenRecorderApp {
             let mut mic_vol = self.mic_volume;
             let mic_name = self.mic_device.clone().unwrap_or_else(|| "Default".into());
             let out_folder = self.output_dir.display().to_string();
+            let ffmpeg_path = crate::encoder::get_ffmpeg_path();
+            let ffmpeg_str = ffmpeg_path.display().to_string();
+            // Cheap per-frame check (no process spawn): absolute paths must
+            // exist on disk; bare "ffmpeg" resolves via PATH at spawn time.
+            let ffmpeg_missing = ffmpeg_path.components().count() > 1 && !ffmpeg_path.exists();
             let rec_locked = self.is_recording();
             let mut rescan = false;
             let mut browse_output = false;
+            let mut browse_ffmpeg = false;
+            let mut reset_ffmpeg = false;
             let mut open = self.show_settings;
             egui::Window::new("Settings")
                 .open(&mut open)
@@ -3890,13 +3994,42 @@ impl eframe::App for ScreenRecorderApp {
                 .min_size([320.0, 260.0])
                 .show(ctx, |ui| {
                     ui.heading(theme::heading("Video"));
-                    ui.add(egui::Slider::new(&mut fps, 15..=60).text("FPS"));
+                    let mut fps_f = fps as f32;
+                    labeled_slider(
+                        ui,
+                        "Frame rate",
+                        format!("{fps} FPS"),
+                        &mut fps_f,
+                        15.0,
+                        60.0,
+                        theme::ACCENT,
+                        "Frames per second of the recorded video (15–60)",
+                    );
+                    fps = fps_f.round().clamp(15.0, 60.0) as u32;
                     ui.separator();
                     ui.heading(theme::heading("Audio"));
                     ui.checkbox(&mut rec_sys, "Record system sound");
                     ui.checkbox(&mut rec_mic, "Record microphone");
-                    ui.add(egui::Slider::new(&mut sys_vol, 0.0..=1.5).text("System volume"));
-                    ui.add(egui::Slider::new(&mut mic_vol, 0.0..=1.5).text("Mic volume"));
+                    labeled_slider(
+                        ui,
+                        "System volume",
+                        format!("{:.0}%", sys_vol / 1.5 * 100.0),
+                        &mut sys_vol,
+                        0.0,
+                        1.5,
+                        theme::METER_BLUE,
+                        "System-sound gain applied when you Save",
+                    );
+                    labeled_slider(
+                        ui,
+                        "Mic volume",
+                        format!("{:.0}%", mic_vol / 1.5 * 100.0),
+                        &mut mic_vol,
+                        0.0,
+                        1.5,
+                        theme::METER_GREEN,
+                        "Microphone gain applied when you Save",
+                    );
                     if ui
                         .button("Rescan audio devices")
                         .on_hover_text("Re-plugged a mic or speaker? Rescan to pick it up")
@@ -3919,6 +4052,22 @@ impl eframe::App for ScreenRecorderApp {
                         theme::hint(ui, "Locked while recording.");
                     }
                     ui.separator();
+                    ui.heading(theme::heading("FFmpeg"));
+                    ui.label(egui::RichText::new(format!("Binary: {}", theme::truncate(&ffmpeg_str, 48))).color(theme::TEXT_MUTED))
+                        .on_hover_text(format!("ffmpeg: {ffmpeg_str}"));
+                    if ffmpeg_missing {
+                        ui.label(egui::RichText::new("Not found — recording/export will fail. Browse to ffmpeg.exe.").color(theme::ERROR_TEXT).small());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse…").on_hover_text("Pick your ffmpeg.exe (remembered across restarts)").clicked() {
+                            browse_ffmpeg = true;
+                        }
+                        if ui.button("Reset to auto").on_hover_text("Forget the custom path and auto-detect again").clicked() {
+                            reset_ffmpeg = true;
+                        }
+                    });
+                    theme::hint(ui, "Applies to the next recording/export.");
+                    ui.separator();
                     theme::hint(
                         ui,
                         "Pipit Screen Recorder — Rust + egui • video via windows-capture + ffmpeg • audio via WASAPI",
@@ -3937,6 +4086,29 @@ impl eframe::App for ScreenRecorderApp {
                 if let Some(dir) = Self::pick_output_dir_dialog(&self.output_dir) {
                     self.set_output_dir(dir);
                 }
+            }
+            if browse_ffmpeg {
+                if let Some(path) = Self::pick_ffmpeg_dialog(&ffmpeg_path) {
+                    match crate::encoder::validate_ffmpeg_path(&path) {
+                        Ok(version) => {
+                            if let Err(e) = crate::encoder::save_custom_ffmpeg_path(&path) {
+                                self.error_message = Some(format!("Picked {version}, but could not remember it: {e}"));
+                            } else {
+                                self.status_message =
+                                    Some(format!("ffmpeg: {} ({})", path.display(), version));
+                            }
+                        }
+                        Err(e) => {
+                            self.error_message =
+                                Some(format!("Not a working ffmpeg ({}): {e}", path.display()));
+                        }
+                    }
+                }
+            }
+            if reset_ffmpeg {
+                crate::encoder::clear_custom_ffmpeg_path();
+                let auto = crate::encoder::get_ffmpeg_path();
+                self.status_message = Some(format!("ffmpeg: auto-detect ({})", auto.display()));
             }
         }
 

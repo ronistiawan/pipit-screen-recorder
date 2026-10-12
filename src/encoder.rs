@@ -5,7 +5,72 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
+fn ffmpeg_config_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| {
+        d.join("Pipit Screen Recorder")
+            .join("ffmpeg_path.txt")
+    })
+}
+
+/// User-overridden ffmpeg binary, remembered across restarts.
+/// Returns `None` if the user never picked one or the saved file is gone.
+pub(crate) fn load_custom_ffmpeg_path() -> Option<PathBuf> {
+    let file = ffmpeg_config_file()?;
+    let text = std::fs::read_to_string(&file).ok()?;
+    let path = PathBuf::from(text.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    // Accept bare names ("ffmpeg") as well as absolute paths.
+    if path.components().count() > 1 && !path.exists() {
+        return None;
+    }
+    Some(path)
+}
+
+pub(crate) fn save_custom_ffmpeg_path(path: &Path) -> Result<()> {
+    let file = ffmpeg_config_file()
+        .ok_or_else(|| anyhow::anyhow!("no config dir for ffmpeg path"))?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&file, path.to_string_lossy().as_bytes())?;
+    Ok(())
+}
+
+pub(crate) fn clear_custom_ffmpeg_path() {
+    if let Some(file) = ffmpeg_config_file() {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Quick sanity check: path exists (unless bare `ffmpeg` on PATH) and
+/// `ffmpeg -version` runs.
+pub(crate) fn validate_ffmpeg_path(path: &Path) -> Result<String> {
+    if path.components().count() > 1 && !path.exists() {
+        anyhow::bail!("file not found: {}", path.display());
+    }
+    let out = Command::new(path)
+        .arg("-version")
+        .output()
+        .with_context(|| format!("failed to launch {}", path.display()))?;
+    if !out.status.success() {
+        anyhow::bail!("{} exited with {}", path.display(), out.status);
+    }
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("ffmpeg")
+        .to_string();
+    Ok(first)
+}
+
 pub(crate) fn get_ffmpeg_path() -> PathBuf {
+    // 1. Explicit user choice from Settings (persistent).
+    if let Some(custom) = load_custom_ffmpeg_path() {
+        return custom;
+    }
+    // 2. Well-known install locations.
     let candidates = [
         PathBuf::from(r"D:\Tools\ffmpeg\bin\ffmpeg.exe"),
         PathBuf::from(r"C:\ffmpeg\bin\ffmpeg.exe"),

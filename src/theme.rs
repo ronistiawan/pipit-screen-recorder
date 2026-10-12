@@ -168,6 +168,71 @@ pub fn pill(ui: &mut egui::Ui, text: &str, fill: Color32, text_color: Color32) {
         });
 }
 
+/// Modern slider: a slim rounded track with an accent fill and a floating
+/// white thumb. Click or drag anywhere on the row to set the value.
+///
+/// Unlike `egui::Slider` there is no trailing value box eating horizontal
+/// space — callers show the value in a label/badge instead — so the row can
+/// safely span the full available width without overflowing its container.
+/// Returns the response so callers can attach their own hover text.
+pub fn modern_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    accent: Color32,
+) -> egui::Response {
+    let h = 24.0_f32;
+    let w = ui.available_width().max(60.0);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+    let span = (max - min).max(f32::EPSILON);
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            // Inset by the thumb radius so the thumb centre maps exactly.
+            let pad = 9.0_f32;
+            let x0 = rect.left() + pad;
+            let x1 = rect.right() - pad;
+            let t = ((p.x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+            *value = (min + t * span).clamp(min, max);
+            resp.mark_changed();
+        }
+    }
+    let enabled = ui.is_enabled();
+    let t = ((*value - min) / span).clamp(0.0, 1.0);
+    let painter = ui.painter_at(rect);
+    let mid = rect.center().y;
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), mid - 3.5),
+        egui::pos2(rect.right(), mid + 3.5),
+    );
+    painter.rect_filled(track_rect, 3.5, METER_TRACK);
+    let pad = 9.0_f32;
+    let x0 = rect.left() + pad;
+    let cx = x0 + t * ((rect.right() - pad) - x0).max(0.0);
+    if cx > rect.left() + 1.0 {
+        let fill_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), mid - 3.5),
+            egui::pos2(cx.max(rect.left() + 7.0), mid + 3.5),
+        );
+        painter.rect_filled(
+            fill_rect,
+            3.5,
+            if enabled { accent } else { BORDER_STRONG },
+        );
+    }
+    // Thumb: soft shadow + white knob + accent ring, grows on hover/drag.
+    let hovered = resp.hovered() || resp.dragged();
+    let r = if hovered { 8.5 } else { 7.5 };
+    let center = egui::pos2(cx.clamp(rect.left() + pad, rect.right() - pad), mid);
+    painter.circle_filled(center, r + 1.5, Color32::from_black_alpha(28));
+    painter.circle_filled(center, r, Color32::WHITE);
+    painter.circle_stroke(
+        center,
+        r,
+        egui::Stroke::new(2.0_f32, if enabled { accent } else { BORDER_STRONG }),
+    );
+    resp
+}
 /// Modern toggle switch (a friendlier checkbox). The knob slides with a
 /// short animation via `animate_bool`, so it feels alive without any manual
 /// repaint bookkeeping — egui repaints while the animation runs.
